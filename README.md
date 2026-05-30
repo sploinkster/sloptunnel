@@ -7,10 +7,13 @@ Current implementation:
 
 - ANSI color TUI with arrow-key selection.
 - Headless server/client mode for remote hosts.
-- UDP and TCP auto-discovery transports. The default mode scans/listens across a
-  range instead of assuming fixed ports.
+- UDP, TCP, and DNS transports. The default `all` mode can stack every available
+  method and scans/listens across a range instead of assuming fixed ports.
+- Proper DNS tunnel mode: client frames are encoded into DNS TXT queries under a
+  configured domain, and server replies are returned as TXT answers on UDP/53.
 - Full-tunnel IPv4 mode using TUN/Wintun. Client traffic is routed through the
   tunnel while the transport socket keeps a host route to the server.
+- Optional tunneled IPv6 addressing/routes with `--ipv6`.
 - Linux server NAT/forwarding setup for EC2 egress.
 - Packet framing with a shared-token validation tag.
 - Round-robin client transmit balancing across all discovered ports.
@@ -57,20 +60,20 @@ Press `q` to quit.
 ## Headless server
 
 ```sh
-./build/sloptunnel --server --transport both --ports auto --token "replace-me" --headless
+./build/sloptunnel --server --transport all --ports auto --token "replace-me" --headless
 ```
 
 For long-running servers, prefer a token file so the secret is not visible in the
 process command line:
 
 ```sh
-./build/sloptunnel --server --transport both --ports auto --token-file /path/to/token --headless
+./build/sloptunnel --server --transport all --ports auto --token-file /path/to/token --headless
 ```
 
 ## Headless client
 
 ```sh
-./build/sloptunnel --client --server-ip 18.219.84.252 --transport both --ports auto --token "replace-me" --rate-mbps 8 --headless
+./build/sloptunnel --client --server-ip 18.219.84.252 --transport all --ports auto --token "replace-me" --rate-mbps 8 --headless
 ```
 
 By default the client installs full-tunnel IPv4 routes. Website browsing, DNS, and
@@ -78,11 +81,23 @@ other IPv4 traffic are routed through the TUN interface once the client is runni
 Use `--no-vpn` for transport benchmarking only, or `--no-route` to create the TUN
 interface without capturing the default route.
 
+DNS tunneling can be used alone or stacked with port masquerading:
+
+```sh
+./build/sloptunnel --server --transport dns --dns-tunnel-domain sploinkstersploinkster.online --token-file /path/to/token --headless
+./build/sloptunnel --client --server-ip 18.219.84.252 --transport tcp+dns --ports 5223 --dns-tunnel-domain sploinkstersploinkster.online --token-file /path/to/token --headless
+```
+
+`--dns-resolver` controls where the client sends DNS tunnel queries. It defaults to
+the server IP, which is useful when the authoritative DNS host is reachable
+directly. Point it at a recursive resolver when testing delegation through normal
+DNS resolution.
+
 You can constrain auto mode when needed:
 
 ```sh
 ./build/sloptunnel --server --transport tcp --ports auto:1-1024 --headless
-./build/sloptunnel --server --transport both --ports auto:1024-65535 --max-auto-ports 4096 --headless
+./build/sloptunnel --server --transport all --ports auto:1024-65535 --max-auto-ports 4096 --headless
 ```
 
 The EC2 security group and host firewall must allow inbound UDP/TCP for the ports the
@@ -93,6 +108,12 @@ Linux server mode creates `sloptun0` at `10.44.0.1/24`, enables IPv4 forwarding,
 adds iptables MASQUERADE/FORWARD rules for `10.44.0.0/24`. The client uses
 `10.44.0.2/24`. Override these with `--tun-name`, `--tun-server-ip`,
 `--tun-client-ip`, `--tun-cidr`, and `--tun-mtu`.
+
+With `--ipv6`, server/client addresses default to `fd44:534c:4f50::1/64` and
+`fd44:534c:4f50::2/64`. Linux server mode enables IPv6 forwarding and attempts
+ip6tables NAT/forwarding rules when `ip6tables` is present; client mode installs
+split IPv6 default routes over the tunnel. Override these with `--tun-server-ip6`,
+`--tun-client-ip6`, and `--tun-cidr6`.
 
 ## Deploy to EC2
 
@@ -107,6 +128,7 @@ headless server with `nohup`. By default the helper starts the EC2 listener thro
 `sudo` so it can bind privileged ports; set `SLOPTUNNEL_USE_SUDO=0` to keep it under
 the `ubuntu` user.
 
-Deploy defaults to `SLOPTUNNEL_TRANSPORT=both` and `SLOPTUNNEL_PORTS=auto`.
+Deploy defaults to `SLOPTUNNEL_TRANSPORT=all`, `SLOPTUNNEL_PORTS=auto`, and
+`SLOPTUNNEL_DNS_DOMAIN=sploinkstersploinkster.online`.
 The helper copies the token into `/home/ubuntu/sloptunnel/token` and starts the
 server with `--token-file`.

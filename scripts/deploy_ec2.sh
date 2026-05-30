@@ -5,13 +5,19 @@ HOST="${SLOPTUNNEL_EC2_HOST:-18.219.84.252}"
 USER_NAME="${SLOPTUNNEL_EC2_USER:-ubuntu}"
 KEY="${SLOPTUNNEL_EC2_KEY:-keys/sloptunnel-ec2.pem}"
 PORTS="${SLOPTUNNEL_PORTS:-auto}"
-TRANSPORT="${SLOPTUNNEL_TRANSPORT:-both}"
+TRANSPORT="${SLOPTUNNEL_TRANSPORT:-all}"
 MAX_AUTO_PORTS="${SLOPTUNNEL_MAX_AUTO_PORTS:-65535}"
 TOKEN="${SLOPTUNNEL_TOKEN:-change-me}"
 REMOTE_DIR="${SLOPTUNNEL_REMOTE_DIR:-/home/ubuntu/sloptunnel}"
 USE_SUDO="${SLOPTUNNEL_USE_SUDO:-1}"
+DNS_DOMAIN="${SLOPTUNNEL_DNS_DOMAIN:-sploinkstersploinkster.online}"
+IPV6_ARG=""
 LOCAL_TOKEN_FILE="$(mktemp)"
 trap 'rm -f "$LOCAL_TOKEN_FILE"' EXIT
+
+if [[ "${SLOPTUNNEL_IPV6:-0}" == "1" ]]; then
+  IPV6_ARG="--ipv6"
+fi
 
 printf '%s\n' "$TOKEN" > "$LOCAL_TOKEN_FILE"
 chmod 600 "$LOCAL_TOKEN_FILE"
@@ -45,14 +51,16 @@ if [[ "$USE_SUDO" == "1" ]]; then
   ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
     "sudo sh -c 'ulimit -n 200000 || ulimit -n 65535 || true; \
      nohup \"$REMOTE_DIR/sloptunnel\" --server --transport \"$TRANSPORT\" --ports \"$PORTS\" \
-     --max-auto-ports \"$MAX_AUTO_PORTS\" --token-file \"$REMOTE_DIR/token\" --headless \
+     --max-auto-ports \"$MAX_AUTO_PORTS\" --dns-tunnel-domain \"$DNS_DOMAIN\" $IPV6_ARG \
+     --token-file \"$REMOTE_DIR/token\" --headless \
      > \"$REMOTE_DIR/server.log\" 2>&1 &'"
 else
   ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
     "(ulimit -n 200000 || ulimit -n 65535 || true; \
      nohup '$REMOTE_DIR/sloptunnel' --server --transport '$TRANSPORT' --ports '$PORTS' \
-     --max-auto-ports '$MAX_AUTO_PORTS' --token-file '$REMOTE_DIR/token' --headless \
+     --max-auto-ports '$MAX_AUTO_PORTS' --dns-tunnel-domain '$DNS_DOMAIN' $IPV6_ARG \
+     --token-file '$REMOTE_DIR/token' --headless \
      > '$REMOTE_DIR/server.log' 2>&1 &)"
 fi
 
-echo "sloptunnel server started on $HOST transport $TRANSPORT ports $PORTS"
+echo "sloptunnel server started on $HOST transport $TRANSPORT ports $PORTS dns-domain $DNS_DOMAIN"

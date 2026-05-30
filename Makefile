@@ -20,10 +20,10 @@ build:
 	mkdir -p build
 
 run-client: $(TARGET)
-	$(TARGET) --client --server-ip 18.219.84.252 --transport both --ports auto
+	$(TARGET) --client --server-ip 18.219.84.252 --transport all --ports auto
 
 run-server: $(TARGET)
-	$(TARGET) --server --transport both --ports auto
+	$(TARGET) --server --transport all --ports auto
 
 clean:
 	rm -rf build

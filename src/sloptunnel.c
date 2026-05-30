@@ -72,17 +72,28 @@ static WINTUN_GET_READ_WAIT_EVENT_FUNC pWintunGetReadWaitEvent;
 #define ST_DEFAULT_MAX_AUTO_PORTS 65535
 #define ST_SCAN_BURST 96
 #define ST_TCP_SCAN_BURST 16
+#define ST_DNS_QUERY_BURST 8
 #define ST_MAX_TCP_PENDING 128
 #define ST_MAX_TCP_CONNS 1024
 #define ST_TCP_CONNECT_TIMEOUT_MS 5000
 #define ST_SERVER_RECV_BUDGET 512
-#define ST_MAX_MENU 9
+#define ST_DNS_PORT 53
+#define ST_DNS_FRAME_MAX 100
+#define ST_DNS_FRAG_HDR 8
+#define ST_DNS_FRAG_DATA (ST_DNS_FRAME_MAX - ST_HEADER_LEN - ST_DNS_FRAG_HDR)
+#define ST_DNS_QUEUE_MAX 512
+#define ST_FRAG_MAX_PACKET 1600
+#define ST_MAX_MENU 12
 #define ST_DEFAULT_SERVER "18.219.84.252"
 #define ST_DEFAULT_TOKEN "change-me"
+#define ST_DEFAULT_DNS_DOMAIN "sploinkstersploinkster.online"
 #define ST_DEFAULT_TUN_NAME "sloptun0"
 #define ST_DEFAULT_TUN_SERVER "10.44.0.1"
 #define ST_DEFAULT_TUN_CLIENT "10.44.0.2"
 #define ST_DEFAULT_TUN_CIDR "10.44.0.0/24"
+#define ST_DEFAULT_TUN_SERVER6 "fd44:534c:4f50::1"
+#define ST_DEFAULT_TUN_CLIENT6 "fd44:534c:4f50::2"
+#define ST_DEFAULT_TUN_CIDR6 "fd44:534c:4f50::/64"
 #define ST_DEFAULT_TUN_MTU 1200
 
 enum {
@@ -90,7 +101,8 @@ enum {
     PKT_HELLO_ACK = 2,
     PKT_DATA = 3,
     PKT_STATS = 4,
-    PKT_BYE = 5
+    PKT_BYE = 5,
+    PKT_DNS_FRAG = 6
 };
 
 typedef enum {
@@ -101,12 +113,15 @@ typedef enum {
 typedef enum {
     TRANSPORT_UDP = 1,
     TRANSPORT_TCP = 2,
-    TRANSPORT_BOTH = 3
+    TRANSPORT_DNS = 4,
+    TRANSPORT_BOTH = 3,
+    TRANSPORT_ALL = 7
 } transport_t;
 
 typedef enum {
     PATH_UDP = 1,
-    PATH_TCP = 2
+    PATH_TCP = 2,
+    PATH_DNS = 3
 } path_proto_t;
 
 typedef enum {
@@ -136,9 +151,15 @@ typedef struct {
     char tun_server_ip[32];
     char tun_client_ip[32];
     char tun_cidr[32];
+    char tun_server_ip6[64];
+    char tun_client_ip6[64];
+    char tun_cidr6[64];
     int tun_mtu;
+    int ipv6_enabled;
     int dns_enabled;
     char dns_server[32];
+    char dns_tunnel_domain[192];
+    char dns_tunnel_resolver[64];
     uint16_t ports[ST_MAX_CONFIG_PORTS];
     int port_count;
     int auto_ports;
@@ -201,6 +222,19 @@ typedef struct {
 } peer_t;
 
 typedef struct {
+    uint32_t id;
+    uint16_t total_len;
+    uint16_t received;
+    uint8_t data[ST_FRAG_MAX_PACKET];
+    uint8_t seen[ST_FRAG_MAX_PACKET];
+} frag_state_t;
+
+typedef struct {
+    uint8_t frame[ST_DNS_FRAME_MAX];
+    size_t len;
+} dns_queue_item_t;
+
+typedef struct {
     int active;
     uint64_t tun_in_bytes;
     uint64_t tun_out_bytes;
@@ -234,10 +268,17 @@ typedef struct {
     uint16_t tcp_probe_next_port;
     int udp_scan_complete;
     int tcp_scan_complete;
+    uint64_t last_dns_poll_ms;
+    uint16_t dns_query_id;
     int server_poll_cursor;
     tcp_pending_t tcp_pending[ST_MAX_TCP_PENDING];
     tcp_conn_t tcp_conns[ST_MAX_TCP_CONNS];
     int tcp_conn_count;
+    dns_queue_item_t dns_queue[ST_DNS_QUEUE_MAX];
+    int dns_queue_head;
+    int dns_queue_tail;
+    int dns_queue_count;
+    frag_state_t dns_frag_in;
     uint64_t key0;
     uint64_t key1;
     uint64_t session;
@@ -360,6 +401,20 @@ static void put_u16(uint8_t *p, uint16_t v) {
 
 static uint16_t get_u16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static void put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static uint32_t get_u32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           ((uint32_t)p[3]);
 }
 
 static void put_u64(uint8_t *p, uint64_t v) {
@@ -603,22 +658,50 @@ static int parse_transport(const char *text, transport_t *transport) {
         *transport = TRANSPORT_TCP;
         return 0;
     }
+    if (strcmp(text, "dns") == 0) {
+        *transport = TRANSPORT_DNS;
+        return 0;
+    }
     if (strcmp(text, "both") == 0 || strcmp(text, "all") == 0) {
-        *transport = TRANSPORT_BOTH;
+        *transport = strcmp(text, "all") == 0 ? TRANSPORT_ALL : TRANSPORT_BOTH;
+        return 0;
+    }
+    if (strcmp(text, "udp+dns") == 0) {
+        *transport = (transport_t)(TRANSPORT_UDP | TRANSPORT_DNS);
+        return 0;
+    }
+    if (strcmp(text, "tcp+dns") == 0) {
+        *transport = (transport_t)(TRANSPORT_TCP | TRANSPORT_DNS);
         return 0;
     }
     return -1;
 }
 
 static int transport_has_udp(transport_t transport) {
-    return transport == TRANSPORT_UDP || transport == TRANSPORT_BOTH;
+    return (transport & TRANSPORT_UDP) != 0;
 }
 
 static int transport_has_tcp(transport_t transport) {
-    return transport == TRANSPORT_TCP || transport == TRANSPORT_BOTH;
+    return (transport & TRANSPORT_TCP) != 0;
+}
+
+static int transport_has_dns(transport_t transport) {
+    return (transport & TRANSPORT_DNS) != 0;
 }
 
 static const char *transport_name(transport_t transport) {
+    if (transport == TRANSPORT_ALL) {
+        return "all";
+    }
+    if (transport == (TRANSPORT_UDP | TRANSPORT_DNS)) {
+        return "udp+dns";
+    }
+    if (transport == (TRANSPORT_TCP | TRANSPORT_DNS)) {
+        return "tcp+dns";
+    }
+    if (transport == TRANSPORT_DNS) {
+        return "dns";
+    }
     if (transport == TRANSPORT_TCP) {
         return "tcp";
     }
@@ -629,7 +712,13 @@ static const char *transport_name(transport_t transport) {
 }
 
 static const char *proto_name(path_proto_t proto) {
-    return proto == PATH_TCP ? "tcp" : "udp";
+    if (proto == PATH_TCP) {
+        return "tcp";
+    }
+    if (proto == PATH_DNS) {
+        return "dns";
+    }
+    return "udp";
 }
 
 static void copy_text(char *dst, size_t dst_len, const char *src);
@@ -662,14 +751,20 @@ static void config_defaults(config_t *cfg) {
     const char *env_token;
     memset(cfg, 0, sizeof(*cfg));
     cfg->mode = MODE_CLIENT;
-    cfg->transport = TRANSPORT_BOTH;
+    cfg->transport = TRANSPORT_ALL;
     snprintf(cfg->server_ip, sizeof(cfg->server_ip), "%s", ST_DEFAULT_SERVER);
     snprintf(cfg->token, sizeof(cfg->token), "%s", ST_DEFAULT_TOKEN);
+    snprintf(cfg->dns_tunnel_domain, sizeof(cfg->dns_tunnel_domain), "%s", ST_DEFAULT_DNS_DOMAIN);
+    snprintf(cfg->dns_tunnel_resolver, sizeof(cfg->dns_tunnel_resolver), "%s", ST_DEFAULT_SERVER);
     snprintf(cfg->tun_name, sizeof(cfg->tun_name), "%s", ST_DEFAULT_TUN_NAME);
     snprintf(cfg->tun_server_ip, sizeof(cfg->tun_server_ip), "%s", ST_DEFAULT_TUN_SERVER);
     snprintf(cfg->tun_client_ip, sizeof(cfg->tun_client_ip), "%s", ST_DEFAULT_TUN_CLIENT);
     snprintf(cfg->tun_cidr, sizeof(cfg->tun_cidr), "%s", ST_DEFAULT_TUN_CIDR);
+    snprintf(cfg->tun_server_ip6, sizeof(cfg->tun_server_ip6), "%s", ST_DEFAULT_TUN_SERVER6);
+    snprintf(cfg->tun_client_ip6, sizeof(cfg->tun_client_ip6), "%s", ST_DEFAULT_TUN_CLIENT6);
+    snprintf(cfg->tun_cidr6, sizeof(cfg->tun_cidr6), "%s", ST_DEFAULT_TUN_CIDR6);
     cfg->tun_mtu = ST_DEFAULT_TUN_MTU;
+    cfg->ipv6_enabled = 0;
     snprintf(cfg->dns_server, sizeof(cfg->dns_server), "%s", "1.1.1.1");
     cfg->dns_enabled = 1;
     cfg->vpn_enabled = 1;
@@ -867,6 +962,490 @@ static int verify_packet(uint8_t *buf, size_t len, uint64_t key0, uint64_t key1,
     return 0;
 }
 
+static int hex_value(int c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+static size_t hex_encode(const uint8_t *in, size_t in_len, char *out, size_t out_len) {
+    static const char digits[] = "0123456789abcdef";
+    size_t i;
+    if (out_len < in_len * 2 + 1) {
+        return 0;
+    }
+    for (i = 0; i < in_len; i++) {
+        out[i * 2] = digits[in[i] >> 4];
+        out[i * 2 + 1] = digits[in[i] & 0x0f];
+    }
+    out[in_len * 2] = '\0';
+    return in_len * 2;
+}
+
+static int hex_decode(const char *in, uint8_t *out, size_t out_len, size_t *decoded_len) {
+    size_t len = strlen(in);
+    size_t i;
+    if ((len & 1U) != 0 || out_len < len / 2) {
+        return -1;
+    }
+    for (i = 0; i < len; i += 2) {
+        int hi = hex_value((unsigned char)in[i]);
+        int lo = hex_value((unsigned char)in[i + 1]);
+        if (hi < 0 || lo < 0) {
+            return -1;
+        }
+        out[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    *decoded_len = len / 2;
+    return 0;
+}
+
+static void normalize_domain(char *domain) {
+    size_t n = strlen(domain);
+    while (n > 0 && domain[n - 1] == '.') {
+        domain[--n] = '\0';
+    }
+    for (n = 0; domain[n]; n++) {
+        domain[n] = (char)tolower((unsigned char)domain[n]);
+    }
+}
+
+static int dns_write_qname(uint8_t *buf, size_t buf_len, size_t *off, const char *name) {
+    char tmp[256];
+    char *label;
+    size_t len;
+    if (!name || !*name || strlen(name) >= sizeof(tmp)) {
+        return -1;
+    }
+    copy_text(tmp, sizeof(tmp), name);
+    normalize_domain(tmp);
+    label = strtok(tmp, ".");
+    while (label) {
+        len = strlen(label);
+        if (len == 0 || len > 63 || *off + len + 1 >= buf_len) {
+            return -1;
+        }
+        buf[(*off)++] = (uint8_t)len;
+        memcpy(buf + *off, label, len);
+        *off += len;
+        label = strtok(NULL, ".");
+    }
+    if (*off >= buf_len) {
+        return -1;
+    }
+    buf[(*off)++] = 0;
+    return 0;
+}
+
+static int dns_read_qname(const uint8_t *buf, size_t len, size_t *off,
+                          char *out, size_t out_len) {
+    size_t pos = *off;
+    size_t used = 0;
+    int jumped = 0;
+    size_t jump_off = 0;
+    int jumps = 0;
+    if (out_len == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    for (;;) {
+        uint8_t l;
+        if (pos >= len) {
+            return -1;
+        }
+        l = buf[pos++];
+        if ((l & 0xc0U) == 0xc0U) {
+            uint16_t ptr;
+            if (pos >= len || ++jumps > 8) {
+                return -1;
+            }
+            ptr = (uint16_t)(((l & 0x3fU) << 8) | buf[pos++]);
+            if (!jumped) {
+                jump_off = pos;
+            }
+            jumped = 1;
+            pos = ptr;
+            continue;
+        }
+        if (l == 0) {
+            break;
+        }
+        if (l > 63 || pos + l > len) {
+            return -1;
+        }
+        if (used && used + 1 < out_len) {
+            out[used++] = '.';
+        }
+        if (used + l >= out_len) {
+            return -1;
+        }
+        memcpy(out + used, buf + pos, l);
+        used += l;
+        pos += l;
+    }
+    out[used] = '\0';
+    normalize_domain(out);
+    *off = jumped ? jump_off : pos;
+    return 0;
+}
+
+static int dns_qname_to_frame(const char *qname, const char *domain,
+                              uint8_t *frame, size_t frame_cap, size_t *frame_len) {
+    char q[256];
+    char d[192];
+    char hex[256];
+    size_t q_len;
+    size_t d_len;
+    size_t prefix_len;
+    size_t used = 0;
+    const char *p;
+    if (strlen(qname) >= sizeof(q) || strlen(domain) >= sizeof(d)) {
+        return -1;
+    }
+    copy_text(q, sizeof(q), qname);
+    copy_text(d, sizeof(d), domain);
+    normalize_domain(q);
+    normalize_domain(d);
+    q_len = strlen(q);
+    d_len = strlen(d);
+    if (q_len <= d_len + 1 || strcmp(q + q_len - d_len, d) != 0 ||
+        q[q_len - d_len - 1] != '.') {
+        return -1;
+    }
+    prefix_len = q_len - d_len - 1;
+    if (prefix_len < 3 || q[0] != 'x' || q[1] != '.') {
+        return -1;
+    }
+    p = q + 2;
+    while ((size_t)(p - q) < prefix_len) {
+        if (*p == '.') {
+            p++;
+            continue;
+        }
+        if (used + 1 >= sizeof(hex)) {
+            return -1;
+        }
+        hex[used++] = *p++;
+    }
+    hex[used] = '\0';
+    return hex_decode(hex, frame, frame_cap, frame_len);
+}
+
+static int dns_frame_to_name(const uint8_t *frame, size_t frame_len,
+                             const char *domain, char *out, size_t out_len) {
+    char hex[ST_DNS_FRAME_MAX * 2 + 1];
+    size_t hex_len;
+    size_t pos = 0;
+    size_t used;
+    if (frame_len > ST_DNS_FRAME_MAX ||
+        hex_encode(frame, frame_len, hex, sizeof(hex)) == 0) {
+        return -1;
+    }
+    used = snprintf(out, out_len, "x");
+    if (used >= out_len) {
+        return -1;
+    }
+    hex_len = strlen(hex);
+    while (pos < hex_len) {
+        size_t chunk = hex_len - pos;
+        int n;
+        if (chunk > 50) {
+            chunk = 50;
+        }
+        n = snprintf(out + used, out_len - used, ".%.*s", (int)chunk, hex + pos);
+        if (n < 0 || (size_t)n >= out_len - used) {
+            return -1;
+        }
+        used += (size_t)n;
+        pos += chunk;
+    }
+    if (snprintf(out + used, out_len - used, ".%s", domain) >= (int)(out_len - used)) {
+        return -1;
+    }
+    return 0;
+}
+
+static size_t dns_build_query(uint8_t *out, size_t out_len, uint16_t id,
+                              const uint8_t *frame, size_t frame_len,
+                              const char *domain) {
+    char qname[256];
+    size_t off = 12;
+    if (out_len < 32 || dns_frame_to_name(frame, frame_len, domain, qname, sizeof(qname)) != 0) {
+        return 0;
+    }
+    memset(out, 0, out_len);
+    put_u16(out + 0, id);
+    put_u16(out + 2, 0x0100);
+    put_u16(out + 4, 1);
+    if (dns_write_qname(out, out_len, &off, qname) != 0 || off + 4 > out_len) {
+        return 0;
+    }
+    put_u16(out + off, 16);
+    put_u16(out + off + 2, 1);
+    off += 4;
+    return off;
+}
+
+static size_t dns_build_response(uint8_t *out, size_t out_len, const uint8_t *query,
+                                 size_t query_len, const uint8_t *frame,
+                                 size_t frame_len) {
+    size_t off = 12;
+    size_t answer_name_off;
+    char qname[256];
+    char hex[ST_DNS_FRAME_MAX * 2 + 1];
+    size_t txt_len;
+    (void)qname;
+    if (query_len < 12 || frame_len > ST_DNS_FRAME_MAX ||
+        hex_encode(frame, frame_len, hex, sizeof(hex)) == 0) {
+        return 0;
+    }
+    if (dns_read_qname(query, query_len, &off, qname, sizeof(qname)) != 0 ||
+        off + 4 > query_len) {
+        return 0;
+    }
+    memset(out, 0, out_len);
+    memcpy(out, query, off + 4);
+    put_u16(out + 2, 0x8180);
+    put_u16(out + 4, 1);
+    put_u16(out + 6, 1);
+    put_u16(out + 8, 0);
+    put_u16(out + 10, 0);
+    off += 4;
+    answer_name_off = off;
+    if (off + 12 >= out_len) {
+        return 0;
+    }
+    out[off++] = 0xc0;
+    out[off++] = 0x0c;
+    put_u16(out + off, 16);
+    put_u16(out + off + 2, 1);
+    put_u16(out + off + 4, 0);
+    put_u16(out + off + 6, 1);
+    txt_len = strlen(hex);
+    if (txt_len > 255 || off + 10 + 1 + txt_len > out_len) {
+        return 0;
+    }
+    put_u16(out + off + 8, (uint16_t)(txt_len + 1));
+    off += 10;
+    out[off++] = (uint8_t)txt_len;
+    memcpy(out + off, hex, txt_len);
+    off += txt_len;
+    (void)answer_name_off;
+    return off;
+}
+
+static int dns_name_in_zone(const char *name, const char *domain) {
+    size_t name_len;
+    size_t domain_len;
+    if (!name || !domain || !*name || !*domain) {
+        return 0;
+    }
+    name_len = strlen(name);
+    domain_len = strlen(domain);
+    if (name_len == domain_len && strcmp(name, domain) == 0) {
+        return 1;
+    }
+    return name_len > domain_len + 1 &&
+           strcmp(name + name_len - domain_len, domain) == 0 &&
+           name[name_len - domain_len - 1] == '.';
+}
+
+static int dns_add_name_rr(uint8_t *out, size_t out_len, size_t *off,
+                           uint16_t type, const char *name) {
+    size_t rdlen_off;
+    size_t rdata_start;
+    if (*off + 12 > out_len) {
+        return -1;
+    }
+    out[(*off)++] = 0xc0;
+    out[(*off)++] = 0x0c;
+    put_u16(out + *off, type);
+    put_u16(out + *off + 2, 1);
+    put_u32(out + *off + 4, 30);
+    rdlen_off = *off + 8;
+    *off += 10;
+    rdata_start = *off;
+    if (dns_write_qname(out, out_len, off, name) != 0) {
+        return -1;
+    }
+    put_u16(out + rdlen_off, (uint16_t)(*off - rdata_start));
+    return 0;
+}
+
+static int dns_add_a_rr(uint8_t *out, size_t out_len, size_t *off, const char *ip) {
+    struct in_addr addr;
+    if (*off + 16 > out_len || inet_pton(AF_INET, ip, &addr) != 1) {
+        return -1;
+    }
+    out[(*off)++] = 0xc0;
+    out[(*off)++] = 0x0c;
+    put_u16(out + *off, 1);
+    put_u16(out + *off + 2, 1);
+    put_u32(out + *off + 4, 30);
+    put_u16(out + *off + 8, 4);
+    *off += 10;
+    memcpy(out + *off, &addr, 4);
+    *off += 4;
+    return 0;
+}
+
+static int dns_add_soa_rr(uint8_t *out, size_t out_len, size_t *off,
+                          const char *mname, const char *rname) {
+    size_t rdlen_off;
+    size_t rdata_start;
+    if (*off + 12 > out_len) {
+        return -1;
+    }
+    out[(*off)++] = 0xc0;
+    out[(*off)++] = 0x0c;
+    put_u16(out + *off, 6);
+    put_u16(out + *off + 2, 1);
+    put_u32(out + *off + 4, 30);
+    rdlen_off = *off + 8;
+    *off += 10;
+    rdata_start = *off;
+    if (dns_write_qname(out, out_len, off, mname) != 0 ||
+        dns_write_qname(out, out_len, off, rname) != 0 ||
+        *off + 20 > out_len) {
+        return -1;
+    }
+    put_u32(out + *off, 1);
+    put_u32(out + *off + 4, 300);
+    put_u32(out + *off + 8, 60);
+    put_u32(out + *off + 12, 86400);
+    put_u32(out + *off + 16, 30);
+    *off += 20;
+    put_u16(out + rdlen_off, (uint16_t)(*off - rdata_start));
+    return 0;
+}
+
+static size_t dns_build_zone_response(uint8_t *out, size_t out_len,
+                                      const uint8_t *query, size_t query_len,
+                                      const char *domain, const char *server_ip) {
+    char qname[256];
+    char zone[192];
+    char ns1[256];
+    char ns2[256];
+    char hostmaster[256];
+    size_t off = 12;
+    size_t question_end;
+    uint16_t qtype;
+    uint16_t qclass;
+    uint16_t answers = 0;
+    if (query_len < 12 || strlen(domain) >= sizeof(zone)) {
+        return 0;
+    }
+    if (dns_read_qname(query, query_len, &off, qname, sizeof(qname)) != 0 ||
+        off + 4 > query_len) {
+        return 0;
+    }
+    qtype = get_u16(query + off);
+    qclass = get_u16(query + off + 2);
+    question_end = off + 4;
+    copy_text(zone, sizeof(zone), domain);
+    normalize_domain(zone);
+    if (!dns_name_in_zone(qname, zone) || (qclass != 1 && qclass != 255)) {
+        return 0;
+    }
+    if (snprintf(ns1, sizeof(ns1), "ns1.%s", zone) >= (int)sizeof(ns1) ||
+        snprintf(ns2, sizeof(ns2), "ns2.%s", zone) >= (int)sizeof(ns2) ||
+        snprintf(hostmaster, sizeof(hostmaster), "hostmaster.%s", zone) >= (int)sizeof(hostmaster)) {
+        return 0;
+    }
+
+    memset(out, 0, out_len);
+    memcpy(out, query, question_end);
+    put_u16(out + 2, 0x8400);
+    put_u16(out + 4, 1);
+    put_u16(out + 6, 0);
+    put_u16(out + 8, 0);
+    put_u16(out + 10, 0);
+    off = question_end;
+
+    if (qtype == 2 || qtype == 255) {
+        if (dns_add_name_rr(out, out_len, &off, 2, ns1) != 0 ||
+            dns_add_name_rr(out, out_len, &off, 2, ns2) != 0) {
+            return 0;
+        }
+        answers = 2;
+    } else if (qtype == 1 || qtype == 255) {
+        if ((strcmp(qname, ns1) == 0 || strcmp(qname, ns2) == 0 ||
+             strcmp(qname, zone) == 0) &&
+            dns_add_a_rr(out, out_len, &off, server_ip) == 0) {
+            answers = 1;
+        }
+    } else if (qtype == 6) {
+        if (dns_add_soa_rr(out, out_len, &off, ns1, hostmaster) != 0) {
+            return 0;
+        }
+        answers = 1;
+    }
+
+    if (answers == 0 && qtype != 16) {
+        if (dns_add_soa_rr(out, out_len, &off, ns1, hostmaster) != 0) {
+            return 0;
+        }
+        put_u16(out + 8, 1);
+    } else {
+        put_u16(out + 6, answers);
+    }
+    return off;
+}
+
+static int dns_extract_txt_frame(const uint8_t *buf, size_t len,
+                                 uint8_t *frame, size_t frame_cap,
+                                 size_t *frame_len) {
+    size_t off = 12;
+    uint16_t qd;
+    uint16_t an;
+    uint16_t i;
+    if (len < 12) {
+        return -1;
+    }
+    qd = get_u16(buf + 4);
+    an = get_u16(buf + 6);
+    for (i = 0; i < qd; i++) {
+        char qname[256];
+        if (dns_read_qname(buf, len, &off, qname, sizeof(qname)) != 0 || off + 4 > len) {
+            return -1;
+        }
+        off += 4;
+    }
+    for (i = 0; i < an; i++) {
+        char name[256];
+        uint16_t type;
+        uint16_t rdlen;
+        if (dns_read_qname(buf, len, &off, name, sizeof(name)) != 0 || off + 10 > len) {
+            return -1;
+        }
+        type = get_u16(buf + off);
+        rdlen = get_u16(buf + off + 8);
+        off += 10;
+        if (off + rdlen > len) {
+            return -1;
+        }
+        if (type == 16 && rdlen > 1 && off + 1 + buf[off] <= off + rdlen) {
+            char hex[256];
+            size_t txt_len = buf[off];
+            if (txt_len >= sizeof(hex)) {
+                return -1;
+            }
+            memcpy(hex, buf + off + 1, txt_len);
+            hex[txt_len] = '\0';
+            return hex_decode(hex, frame, frame_cap, frame_len);
+        }
+        off += rdlen;
+    }
+    return -1;
+}
+
 static int make_udp_socket(uint16_t port, int bind_any, const char *remote_ip,
                            socket_t *fd, struct sockaddr_in *remote) {
     socket_t s;
@@ -1005,7 +1584,17 @@ static int auto_capacity(const config_t *cfg) {
 }
 
 static int transport_count(transport_t transport) {
-    return transport == TRANSPORT_BOTH ? 2 : 1;
+    int n = 0;
+    if (transport_has_udp(transport)) {
+        n++;
+    }
+    if (transport_has_tcp(transport)) {
+        n++;
+    }
+    if (transport_has_dns(transport)) {
+        n++;
+    }
+    return n > 0 ? n : 1;
 }
 
 static path_t *find_path(engine_t *e, path_proto_t proto, uint16_t port) {
@@ -1077,6 +1666,162 @@ static int count_active_peers(engine_t *e, uint64_t now) {
     return n;
 }
 
+static int dns_queue_push_frame(engine_t *e, const uint8_t *frame, size_t frame_len) {
+    dns_queue_item_t *item;
+    if (frame_len > ST_DNS_FRAME_MAX || e->dns_queue_count >= ST_DNS_QUEUE_MAX) {
+        e->vpn.dropped_packets++;
+        return -1;
+    }
+    item = &e->dns_queue[e->dns_queue_tail];
+    memcpy(item->frame, frame, frame_len);
+    item->len = frame_len;
+    e->dns_queue_tail = (e->dns_queue_tail + 1) % ST_DNS_QUEUE_MAX;
+    e->dns_queue_count++;
+    return 0;
+}
+
+static int dns_queue_pop_frame(engine_t *e, uint8_t *frame, size_t *frame_len) {
+    dns_queue_item_t *item;
+    if (e->dns_queue_count <= 0) {
+        return -1;
+    }
+    item = &e->dns_queue[e->dns_queue_head];
+    memcpy(frame, item->frame, item->len);
+    *frame_len = item->len;
+    item->len = 0;
+    e->dns_queue_head = (e->dns_queue_head + 1) % ST_DNS_QUEUE_MAX;
+    e->dns_queue_count--;
+    return 0;
+}
+
+static int dns_send_frame_query(engine_t *e, path_t *p, const uint8_t *frame, size_t frame_len) {
+    uint8_t dns[512];
+    size_t dns_len;
+    int sent;
+    if (frame_len > ST_DNS_FRAME_MAX) {
+        return -1;
+    }
+    dns_len = dns_build_query(dns, sizeof(dns), ++e->dns_query_id,
+                              frame, frame_len, e->cfg.dns_tunnel_domain);
+    if (dns_len == 0) {
+        return -1;
+    }
+    sent = (int)sendto(p->fd, (const char *)dns, (int)dns_len, 0,
+                       (const struct sockaddr *)&p->remote, sizeof(p->remote));
+    if (sent < 0) {
+        return socket_would_block() ? 0 : -1;
+    }
+    p->tx_bytes += (uint64_t)sent;
+    p->tx_packets++;
+    e->total_tx += (uint64_t)sent;
+    return sent;
+}
+
+static int dns_send_packet_path(engine_t *e, path_t *p, uint8_t type, uint8_t port_index,
+                                uint64_t seq, const uint8_t *payload,
+                                uint16_t payload_len) {
+    uint8_t frame[ST_DNS_FRAME_MAX];
+    size_t frame_len;
+    if (payload_len + ST_HEADER_LEN > ST_DNS_FRAME_MAX) {
+        return -1;
+    }
+    frame_len = build_packet(frame, type, port_index, e->session, seq, payload,
+                             payload_len, e->key0, e->key1);
+    return dns_send_frame_query(e, p, frame, frame_len);
+}
+
+static int dns_queue_packet(engine_t *e, uint8_t type, uint8_t port_index,
+                            uint64_t seq, const uint8_t *payload,
+                            uint16_t payload_len) {
+    uint8_t frame[ST_DNS_FRAME_MAX];
+    size_t frame_len;
+    if (payload_len + ST_HEADER_LEN > ST_DNS_FRAME_MAX) {
+        return -1;
+    }
+    frame_len = build_packet(frame, type, port_index, e->session, seq, payload,
+                             payload_len, e->key0, e->key1);
+    return dns_queue_push_frame(e, frame, frame_len);
+}
+
+static int dns_fragment_send_or_queue(engine_t *e, path_t *p, const uint8_t *packet,
+                                      size_t packet_len, int queue_only) {
+    uint32_t frag_id = (uint32_t)(e->seq++ & 0xffffffffU);
+    size_t off = 0;
+    int sent_any = 0;
+    int idx = p ? (int)(p - e->paths) : 0;
+    if (packet_len > ST_FRAG_MAX_PACKET) {
+        return -1;
+    }
+    while (off < packet_len) {
+        uint8_t payload[ST_DNS_FRAG_HDR + ST_DNS_FRAG_DATA];
+        size_t chunk = packet_len - off;
+        uint64_t seq = e->seq++;
+        int rc;
+        if (chunk > ST_DNS_FRAG_DATA) {
+            chunk = ST_DNS_FRAG_DATA;
+        }
+        put_u32(payload, frag_id);
+        put_u16(payload + 4, (uint16_t)packet_len);
+        put_u16(payload + 6, (uint16_t)off);
+        memcpy(payload + ST_DNS_FRAG_HDR, packet + off, chunk);
+        if (queue_only) {
+            rc = dns_queue_packet(e, PKT_DNS_FRAG, (uint8_t)idx, seq, payload,
+                                  (uint16_t)(ST_DNS_FRAG_HDR + chunk));
+        } else {
+            remember_sent(e, seq, now_ms());
+            rc = dns_send_packet_path(e, p, PKT_DNS_FRAG, (uint8_t)idx, seq, payload,
+                                      (uint16_t)(ST_DNS_FRAG_HDR + chunk));
+        }
+        if (rc < 0) {
+            return sent_any ? sent_any : -1;
+        }
+        sent_any += rc > 0 ? rc : 1;
+        off += chunk;
+    }
+    return sent_any;
+}
+
+static int dns_reassemble_fragment(engine_t *e, const uint8_t *payload,
+                                   uint16_t payload_len, uint8_t *packet,
+                                   size_t *packet_len) {
+    frag_state_t *f = &e->dns_frag_in;
+    uint32_t frag_id;
+    uint16_t total_len;
+    uint16_t off;
+    uint16_t chunk_len;
+    uint16_t i;
+    if (payload_len <= ST_DNS_FRAG_HDR) {
+        return -1;
+    }
+    frag_id = get_u32(payload);
+    total_len = get_u16(payload + 4);
+    off = get_u16(payload + 6);
+    chunk_len = (uint16_t)(payload_len - ST_DNS_FRAG_HDR);
+    if (total_len == 0 || total_len > ST_FRAG_MAX_PACKET || off >= total_len ||
+        off + chunk_len > total_len) {
+        return -1;
+    }
+    if (f->id != frag_id || f->total_len != total_len) {
+        memset(f, 0, sizeof(*f));
+        f->id = frag_id;
+        f->total_len = total_len;
+    }
+    for (i = 0; i < chunk_len; i++) {
+        if (!f->seen[off + i]) {
+            f->seen[off + i] = 1;
+            f->received++;
+        }
+        f->data[off + i] = payload[ST_DNS_FRAG_HDR + i];
+    }
+    if (f->received >= f->total_len) {
+        memcpy(packet, f->data, f->total_len);
+        *packet_len = f->total_len;
+        memset(f, 0, sizeof(*f));
+        return 1;
+    }
+    return 0;
+}
+
 static int send_all_now(socket_t fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -1110,6 +1855,9 @@ static int send_packet_path(engine_t *e, path_t *p, uint8_t type, uint8_t port_i
     int sent;
     const struct sockaddr_in *dst = to ? to : &p->remote;
 
+    if (p->proto == PATH_DNS) {
+        return dns_send_packet_path(e, p, type, port_index, seq, payload, payload_len);
+    }
     if (p->proto == PATH_TCP) {
         sent = send_all_now(p->fd, packet, len);
     } else {
@@ -1320,6 +2068,10 @@ static int safe_token_text(const char *s) {
     return 1;
 }
 
+static int safe_optional_text(const char *s) {
+    return !s || !*s || safe_token_text(s);
+}
+
 #ifdef _WIN32
 static int widen_text(const char *src, wchar_t *dst, size_t dst_count) {
     int n = MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, (int)dst_count);
@@ -1361,6 +2113,8 @@ static int vpn_start(engine_t *e) {
     vpn_state_t *v = &e->vpn;
     const char *local_ip;
     const char *peer_ip;
+    const char *local_ip6;
+    const char *peer_ip6;
     memset(v, 0, sizeof(*v));
 #ifndef _WIN32
     v->fd = ST_INVALID_SOCKET;
@@ -1370,7 +2124,11 @@ static int vpn_start(engine_t *e) {
     }
     if (!safe_token_text(e->cfg.tun_name) || !safe_token_text(e->cfg.server_ip) ||
         !safe_token_text(e->cfg.tun_server_ip) || !safe_token_text(e->cfg.tun_client_ip) ||
-        !safe_token_text(e->cfg.tun_cidr) || !safe_token_text(e->cfg.dns_server)) {
+        !safe_token_text(e->cfg.tun_cidr) || !safe_token_text(e->cfg.dns_server) ||
+        !safe_token_text(e->cfg.dns_tunnel_domain) ||
+        !safe_optional_text(e->cfg.dns_tunnel_resolver) ||
+        !safe_token_text(e->cfg.tun_server_ip6) || !safe_token_text(e->cfg.tun_client_ip6) ||
+        !safe_token_text(e->cfg.tun_cidr6)) {
         set_status(e, "Unsafe tunnel, server, or DNS setting");
         return -1;
     }
@@ -1382,13 +2140,14 @@ static int vpn_start(engine_t *e) {
 #endif
     local_ip = e->cfg.mode == MODE_SERVER ? e->cfg.tun_server_ip : e->cfg.tun_client_ip;
     peer_ip = e->cfg.mode == MODE_SERVER ? e->cfg.tun_client_ip : e->cfg.tun_server_ip;
+    local_ip6 = e->cfg.mode == MODE_SERVER ? e->cfg.tun_server_ip6 : e->cfg.tun_client_ip6;
+    peer_ip6 = e->cfg.mode == MODE_SERVER ? e->cfg.tun_client_ip6 : e->cfg.tun_server_ip6;
 
 #ifdef _WIN32
     {
         wchar_t name_w[96];
         wchar_t type_w[32];
         char cmd[1024];
-        (void)peer_ip;
         if (load_wintun(v) != 0) {
             set_status(e, "wintun.dll not found or missing API");
             return -1;
@@ -1420,6 +2179,14 @@ static int vpn_start(engine_t *e) {
                  "netsh interface ipv4 set interface \"%s\" metric=1",
                  e->cfg.tun_name);
         systemf("%s", cmd);
+        if (e->cfg.ipv6_enabled) {
+            snprintf(cmd, sizeof(cmd),
+                     "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                     "\"New-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -PrefixLength 64 -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction SilentlyContinue; "
+                     "Set-NetIPInterface -InterfaceAlias '%s' -AddressFamily IPv6 -InterfaceMetric 1 -ErrorAction SilentlyContinue\"",
+                     e->cfg.tun_name, local_ip6, e->cfg.tun_name);
+            systemf("%s", cmd);
+        }
         if (e->cfg.mode == MODE_CLIENT && e->cfg.dns_enabled) {
             snprintf(cmd, sizeof(cmd),
                      "netsh interface ip set dns name=\"%s\" static %s",
@@ -1436,6 +2203,14 @@ static int vpn_start(engine_t *e) {
                      e->cfg.server_ip, e->cfg.server_ip, e->cfg.tun_name, peer_ip,
                      e->cfg.tun_name, peer_ip);
             systemf("%s", cmd);
+            if (e->cfg.ipv6_enabled) {
+                snprintf(cmd, sizeof(cmd),
+                         "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                         "\"New-NetRoute -DestinationPrefix '::/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue; "
+                         "New-NetRoute -DestinationPrefix '8000::/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue\"",
+                         e->cfg.tun_name, peer_ip6, e->cfg.tun_name, peer_ip6);
+                systemf("%s", cmd);
+            }
         }
     }
 #else
@@ -1459,6 +2234,10 @@ static int vpn_start(engine_t *e) {
         systemf("ip link set dev %s down >/dev/null 2>&1 || true", e->cfg.tun_name);
         systemf("ip addr flush dev %s >/dev/null 2>&1 || true", e->cfg.tun_name);
         systemf("ip addr add %s/24 dev %s", local_ip, e->cfg.tun_name);
+        if (e->cfg.ipv6_enabled) {
+            systemf("ip -6 addr add %s/64 dev %s >/dev/null 2>&1 || true",
+                    local_ip6, e->cfg.tun_name);
+        }
         systemf("ip link set dev %s mtu %d up", e->cfg.tun_name, e->cfg.tun_mtu);
 
         if (e->cfg.mode == MODE_SERVER) {
@@ -1466,6 +2245,11 @@ static int vpn_start(engine_t *e) {
                           v->route_gw, sizeof(v->route_gw));
             if (system("sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true") == -1) {
                 set_status(e, "Could not enable IPv4 forwarding");
+            }
+            if (e->cfg.ipv6_enabled) {
+                if (system("sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true") == -1) {
+                    set_status(e, "Could not enable IPv6 forwarding");
+                }
             }
             if (v->egress_dev[0]) {
                 systemf("iptables -t nat -C POSTROUTING -s %s -o %s -j MASQUERADE >/dev/null 2>&1 || "
@@ -1477,6 +2261,23 @@ static int vpn_start(engine_t *e) {
                 systemf("iptables -C FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || "
                         "iptables -A FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT",
                         v->egress_dev, e->cfg.tun_name, v->egress_dev, e->cfg.tun_name);
+                if (e->cfg.ipv6_enabled) {
+                    systemf("command -v ip6tables >/dev/null 2>&1 && "
+                            "ip6tables -t nat -C POSTROUTING -s %s -o %s -j MASQUERADE >/dev/null 2>&1 || "
+                            "command -v ip6tables >/dev/null 2>&1 && "
+                            "ip6tables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE >/dev/null 2>&1 || true",
+                            e->cfg.tun_cidr6, v->egress_dev, e->cfg.tun_cidr6, v->egress_dev);
+                    systemf("command -v ip6tables >/dev/null 2>&1 && "
+                            "ip6tables -C FORWARD -i %s -o %s -j ACCEPT >/dev/null 2>&1 || "
+                            "command -v ip6tables >/dev/null 2>&1 && "
+                            "ip6tables -A FORWARD -i %s -o %s -j ACCEPT >/dev/null 2>&1 || true",
+                            e->cfg.tun_name, v->egress_dev, e->cfg.tun_name, v->egress_dev);
+                    systemf("command -v ip6tables >/dev/null 2>&1 && "
+                            "ip6tables -C FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || "
+                            "command -v ip6tables >/dev/null 2>&1 && "
+                            "ip6tables -A FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true",
+                            v->egress_dev, e->cfg.tun_name, v->egress_dev, e->cfg.tun_name);
+                }
             }
         } else if (e->cfg.route_all) {
             capture_route(e->cfg.server_ip, v->route_dev, sizeof(v->route_dev),
@@ -1491,6 +2292,12 @@ static int vpn_start(engine_t *e) {
                     peer_ip, e->cfg.tun_name);
             systemf("ip route add 128.0.0.0/1 via %s dev %s >/dev/null 2>&1 || true",
                     peer_ip, e->cfg.tun_name);
+            if (e->cfg.ipv6_enabled) {
+                systemf("ip -6 route add ::/1 via %s dev %s >/dev/null 2>&1 || true",
+                        peer_ip6, e->cfg.tun_name);
+                systemf("ip -6 route add 8000::/1 via %s dev %s >/dev/null 2>&1 || true",
+                        peer_ip6, e->cfg.tun_name);
+            }
             if (e->cfg.dns_enabled) {
                 systemf("command -v resolvectl >/dev/null 2>&1 && "
                         "resolvectl dns %s %s >/dev/null 2>&1 && "
@@ -1518,8 +2325,20 @@ static void vpn_stop(engine_t *e) {
                  "powershell -NoProfile -ExecutionPolicy Bypass -Command "
                  "\"Remove-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '%s' -Confirm:$false -ErrorAction SilentlyContinue; "
                  "Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '%s' -Confirm:$false -ErrorAction SilentlyContinue; "
+                 "Remove-NetRoute -DestinationPrefix '::/1' -InterfaceAlias '%s' -Confirm:$false -ErrorAction SilentlyContinue; "
+                 "Remove-NetRoute -DestinationPrefix '8000::/1' -InterfaceAlias '%s' -Confirm:$false -ErrorAction SilentlyContinue; "
                  "Remove-NetRoute -DestinationPrefix '%s/32' -Confirm:$false -ErrorAction SilentlyContinue\"",
-                 e->cfg.tun_name, e->cfg.tun_name, e->cfg.server_ip);
+                 e->cfg.tun_name, e->cfg.tun_name, e->cfg.tun_name,
+                 e->cfg.tun_name, e->cfg.server_ip);
+        systemf("%s", cmd);
+    }
+    if (e->cfg.ipv6_enabled) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                 "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                 "\"Remove-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -Confirm:$false -ErrorAction SilentlyContinue\"",
+                 e->cfg.tun_name,
+                 e->cfg.mode == MODE_SERVER ? e->cfg.tun_server_ip6 : e->cfg.tun_client_ip6);
         systemf("%s", cmd);
     }
     if (e->cfg.mode == MODE_CLIENT && e->cfg.dns_enabled) {
@@ -1544,6 +2363,10 @@ static void vpn_stop(engine_t *e) {
         }
         systemf("ip route del 0.0.0.0/1 dev %s >/dev/null 2>&1 || true", e->cfg.tun_name);
         systemf("ip route del 128.0.0.0/1 dev %s >/dev/null 2>&1 || true", e->cfg.tun_name);
+        if (e->cfg.ipv6_enabled) {
+            systemf("ip -6 route del ::/1 dev %s >/dev/null 2>&1 || true", e->cfg.tun_name);
+            systemf("ip -6 route del 8000::/1 dev %s >/dev/null 2>&1 || true", e->cfg.tun_name);
+        }
         systemf("ip route del %s/32 >/dev/null 2>&1 || true", e->cfg.server_ip);
     }
     if (e->cfg.mode == MODE_SERVER && v->egress_dev[0]) {
@@ -1553,6 +2376,17 @@ static void vpn_stop(engine_t *e) {
                 e->cfg.tun_name, v->egress_dev);
         systemf("iptables -D FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true",
                 v->egress_dev, e->cfg.tun_name);
+        if (e->cfg.ipv6_enabled) {
+            systemf("command -v ip6tables >/dev/null 2>&1 && "
+                    "ip6tables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE >/dev/null 2>&1 || true",
+                    e->cfg.tun_cidr6, v->egress_dev);
+            systemf("command -v ip6tables >/dev/null 2>&1 && "
+                    "ip6tables -D FORWARD -i %s -o %s -j ACCEPT >/dev/null 2>&1 || true",
+                    e->cfg.tun_name, v->egress_dev);
+            systemf("command -v ip6tables >/dev/null 2>&1 && "
+                    "ip6tables -D FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true",
+                    v->egress_dev, e->cfg.tun_name);
+        }
     }
     if (v->fd >= 0) {
         close(v->fd);
@@ -1654,6 +2488,12 @@ static int engine_start(engine_t *e) {
     e->tcp_probe_next_port = e->cfg.range_start;
     e->udp_scan_complete = 0;
     e->tcp_scan_complete = 0;
+    e->last_dns_poll_ms = 0;
+    e->dns_query_id = (uint16_t)(now_ms() & 0xffffU);
+    e->dns_queue_head = 0;
+    e->dns_queue_tail = 0;
+    e->dns_queue_count = 0;
+    memset(&e->dns_frag_in, 0, sizeof(e->dns_frag_in));
     e->server_poll_cursor = 0;
     e->session = random_session_id();
     e->seq = 1;
@@ -1682,6 +2522,33 @@ static int engine_start(engine_t *e) {
     }
     e->path_capacity = capacity;
 
+    if (transport_has_dns(e->cfg.transport)) {
+        path_t *p = add_path(e, PATH_DNS, ST_DNS_PORT);
+        const char *resolver = e->cfg.dns_tunnel_resolver[0] ?
+                               e->cfg.dns_tunnel_resolver : e->cfg.server_ip;
+        if (!p) {
+            set_status(e, "No capacity for DNS tunnel path");
+            engine_stop(e);
+            return -1;
+        }
+        if (e->cfg.mode == MODE_SERVER) {
+            if (make_udp_socket(ST_DNS_PORT, 1, NULL, &p->fd, NULL) != 0) {
+                e->path_count--;
+                set_status(e, "Could not bind DNS UDP port 53");
+                engine_stop(e);
+                return -1;
+            }
+        } else {
+            if (make_unbound_udp_socket(&p->fd) != 0 ||
+                fill_remote_addr(resolver, ST_DNS_PORT, &p->remote) != 0) {
+                e->path_count--;
+                set_status(e, "Could not create DNS tunnel socket");
+                engine_stop(e);
+                return -1;
+            }
+        }
+    }
+
     if (e->cfg.auto_ports && e->cfg.mode == MODE_SERVER) {
         uint32_t port;
         for (port = e->cfg.range_start; port <= (uint32_t)e->cfg.range_end; port++) {
@@ -1701,6 +2568,9 @@ static int engine_start(engine_t *e) {
                 break;
             }
             if (transport_has_udp(e->cfg.transport)) {
+                if (transport_has_dns(e->cfg.transport) && port == ST_DNS_PORT) {
+                    continue;
+                }
                 path_t *p = add_path(e, PATH_UDP, (uint16_t)port);
                 if (!p) {
                     break;
@@ -1739,6 +2609,9 @@ static int engine_start(engine_t *e) {
                     }
                 }
                 if (transport_has_udp(e->cfg.transport)) {
+                    if (transport_has_dns(e->cfg.transport) && e->cfg.ports[i] == ST_DNS_PORT) {
+                        continue;
+                    }
                     path_t *p = add_path(e, PATH_UDP, e->cfg.ports[i]);
                     if (!p || make_udp_socket(p->port, 1, NULL, &p->fd, NULL) != 0) {
                         if (p) {
@@ -1783,6 +2656,9 @@ static int engine_start(engine_t *e) {
         }
     } else if (e->cfg.mode == MODE_CLIENT) {
         for (i = 0; i < e->path_count; i++) {
+            if (e->paths[i].proto == PATH_DNS) {
+                continue;
+            }
             if (fill_remote_addr(e->cfg.server_ip, e->paths[i].port, &e->paths[i].remote) != 0) {
                 set_status(e, "Invalid server IP or socket failure for %s:%u",
                            e->cfg.server_ip, (unsigned)e->paths[i].port);
@@ -2306,6 +3182,181 @@ static void receive_client_shared(engine_t *e, uint64_t now) {
     }
 }
 
+static void process_client_dns_frame(engine_t *e, path_t *p, uint8_t *frame,
+                                     size_t frame_len, uint64_t now) {
+    uint8_t type = 0;
+    uint8_t port_index = 0;
+    uint64_t session = 0;
+    uint64_t seq = 0;
+    uint8_t *payload = NULL;
+    uint16_t payload_len = 0;
+    uint64_t sent_ms = 0;
+    uint8_t packet[ST_FRAG_MAX_PACKET];
+    size_t packet_len = 0;
+    if (verify_packet(frame, frame_len, e->key0, e->key1, &type, &port_index,
+                      &session, &seq, &payload, &payload_len) != 0) {
+        return;
+    }
+    (void)session;
+    (void)port_index;
+    p->rx_bytes += (uint64_t)frame_len;
+    p->rx_packets++;
+    e->total_rx += (uint64_t)frame_len;
+    p->last_ack_ms = now;
+    p->healthy = 1;
+
+    if (type == PKT_DNS_FRAG) {
+        int rc = dns_reassemble_fragment(e, payload, payload_len, packet, &packet_len);
+        if (rc > 0 && e->vpn.active) {
+            if (vpn_write_packet(e, packet, packet_len) > 0) {
+                e->vpn.tun_out_bytes += packet_len;
+                e->vpn.tun_out_packets++;
+            } else {
+                e->vpn.dropped_packets++;
+            }
+        } else if (rc < 0) {
+            e->vpn.dropped_packets++;
+        }
+    } else if (type == PKT_DATA && e->vpn.active && payload_len > 0) {
+        if (vpn_write_packet(e, payload, payload_len) > 0) {
+            e->vpn.tun_out_bytes += payload_len;
+            e->vpn.tun_out_packets++;
+        } else {
+            e->vpn.dropped_packets++;
+        }
+    }
+    if ((type == PKT_STATS || type == PKT_HELLO_ACK) && find_sent(e, seq, &sent_ms) == 0) {
+        p->rtt_ms = (double)(now - sent_ms);
+    }
+}
+
+static void receive_client_dns(engine_t *e, path_t *p, uint64_t now) {
+    uint8_t buf[768];
+    struct sockaddr_in from;
+#ifdef _WIN32
+    int from_len = sizeof(from);
+#else
+    socklen_t from_len = sizeof(from);
+#endif
+    for (;;) {
+        uint8_t frame[ST_DNS_FRAME_MAX];
+        size_t frame_len = 0;
+        int got = (int)recvfrom(p->fd, (char *)buf, sizeof(buf), 0,
+                                (struct sockaddr *)&from, &from_len);
+        if (got < 0) {
+            if (!socket_would_block()) {
+                set_status(e, "DNS recv error");
+            }
+            break;
+        }
+        if (dns_extract_txt_frame(buf, (size_t)got, frame, sizeof(frame), &frame_len) == 0) {
+            process_client_dns_frame(e, p, frame, frame_len, now);
+        }
+    }
+}
+
+static void receive_server_dns(engine_t *e, path_t *p, int index, uint64_t now) {
+    uint8_t buf[768];
+    struct sockaddr_in from;
+#ifdef _WIN32
+    int from_len = sizeof(from);
+#else
+    socklen_t from_len = sizeof(from);
+#endif
+    for (;;) {
+        int got;
+        char qname[256];
+        size_t off = 12;
+        uint8_t frame[ST_DNS_FRAME_MAX];
+        uint8_t reply_frame[ST_DNS_FRAME_MAX];
+        size_t frame_len = 0;
+        size_t reply_len = 0;
+        uint8_t type = 0;
+        uint8_t port_index = 0;
+        uint64_t session = 0;
+        uint64_t seq = 0;
+        uint8_t *payload = NULL;
+        uint16_t payload_len = 0;
+        uint8_t packet[ST_FRAG_MAX_PACKET];
+        size_t packet_len = 0;
+        uint8_t response[768];
+        size_t response_len;
+
+        got = (int)recvfrom(p->fd, (char *)buf, sizeof(buf), 0,
+                            (struct sockaddr *)&from, &from_len);
+        if (got < 0) {
+            if (!socket_would_block()) {
+                set_status(e, "DNS server recv error");
+            }
+            break;
+        }
+        if ((size_t)got < 12 ||
+            dns_read_qname(buf, (size_t)got, &off, qname, sizeof(qname)) != 0) {
+            continue;
+        }
+        if (dns_qname_to_frame(qname, e->cfg.dns_tunnel_domain, frame, sizeof(frame), &frame_len) != 0 ||
+            verify_packet(frame, frame_len, e->key0, e->key1, &type, &port_index,
+                          &session, &seq, &payload, &payload_len) != 0) {
+            response_len = dns_build_zone_response(response, sizeof(response), buf, (size_t)got,
+                                                   e->cfg.dns_tunnel_domain, e->cfg.server_ip);
+            if (response_len > 0) {
+                int sent = (int)sendto(p->fd, (const char *)response, (int)response_len, 0,
+                                       (struct sockaddr *)&from, from_len);
+                if (sent > 0) {
+                    p->tx_bytes += (uint64_t)sent;
+                    p->tx_packets++;
+                    e->total_tx += (uint64_t)sent;
+                }
+            }
+            continue;
+        }
+
+        p->rx_bytes += (uint64_t)got;
+        p->rx_packets++;
+        e->total_rx += (uint64_t)got;
+        mark_peer(e, session, now, (size_t)got);
+        p->remote = from;
+
+        if (type == PKT_DNS_FRAG) {
+            int rc = dns_reassemble_fragment(e, payload, payload_len, packet, &packet_len);
+            if (rc > 0 && e->vpn.active) {
+                if (vpn_write_packet(e, packet, packet_len) > 0) {
+                    e->vpn.tun_out_bytes += packet_len;
+                    e->vpn.tun_out_packets++;
+                } else {
+                    e->vpn.dropped_packets++;
+                }
+            } else if (rc < 0) {
+                e->vpn.dropped_packets++;
+            }
+        } else if (type == PKT_DATA && e->vpn.active && payload_len > 0) {
+            if (vpn_write_packet(e, payload, payload_len) > 0) {
+                e->vpn.tun_out_bytes += payload_len;
+                e->vpn.tun_out_packets++;
+            } else {
+                e->vpn.dropped_packets++;
+            }
+        }
+
+        if (dns_queue_pop_frame(e, reply_frame, &reply_len) != 0) {
+            reply_len = build_packet(reply_frame, type == PKT_HELLO ? PKT_HELLO_ACK : PKT_STATS,
+                                     (uint8_t)index, e->session, seq, NULL, 0,
+                                     e->key0, e->key1);
+        }
+        response_len = dns_build_response(response, sizeof(response), buf, (size_t)got,
+                                          reply_frame, reply_len);
+        if (response_len > 0) {
+            int sent = (int)sendto(p->fd, (const char *)response, (int)response_len, 0,
+                                   (struct sockaddr *)&from, from_len);
+            if (sent > 0) {
+                p->tx_bytes += (uint64_t)sent;
+                p->tx_packets++;
+                e->total_tx += (uint64_t)sent;
+            }
+        }
+    }
+}
+
 static void client_probe_udp_auto(engine_t *e, uint64_t now) {
     int i;
     for (i = 0; i < ST_SCAN_BURST; i++) {
@@ -2355,6 +3406,24 @@ static void client_probe_tcp_fixed(engine_t *e, uint64_t now) {
     }
 }
 
+static void client_poll_dns(engine_t *e, uint64_t now) {
+    int i;
+    int burst;
+    if (now - e->last_dns_poll_ms < 50) {
+        return;
+    }
+    for (i = 0; i < e->path_count; i++) {
+        if (e->paths[i].proto == PATH_DNS) {
+            for (burst = 0; burst < ST_DNS_QUERY_BURST; burst++) {
+                uint64_t seq = e->seq++;
+                remember_sent(e, seq, now);
+                send_packet_path(e, &e->paths[i], PKT_HELLO, (uint8_t)i, seq, NULL, 0, NULL);
+            }
+        }
+    }
+    e->last_dns_poll_ms = now;
+}
+
 static path_t *choose_path(engine_t *e) {
     int tries;
     if (e->path_count <= 0) {
@@ -2389,6 +3458,8 @@ static int server_send_tunnel_packet(engine_t *e, const uint8_t *payload, uint16
                 continue;
             }
             sent = send_packet_path(e, p, PKT_DATA, (uint8_t)idx, seq, payload, payload_len, NULL);
+        } else if (p->proto == PATH_DNS) {
+            sent = dns_fragment_send_or_queue(e, p, payload, payload_len, 1);
         } else {
             int i;
             for (i = 0; i < e->tcp_conn_count; i++) {
@@ -2438,10 +3509,14 @@ static void vpn_pump_tun(engine_t *e, uint64_t now) {
                 continue;
             }
             idx = (int)(p - e->paths);
-            seq = e->seq++;
-            remember_sent(e, seq, now);
-            sent = send_packet_path(e, p, PKT_DATA, (uint8_t)idx, seq,
-                                    packet, (uint16_t)n, NULL);
+            if (p->proto == PATH_DNS) {
+                sent = dns_fragment_send_or_queue(e, p, packet, (size_t)n, 0);
+            } else {
+                seq = e->seq++;
+                remember_sent(e, seq, now);
+                sent = send_packet_path(e, p, PKT_DATA, (uint8_t)idx, seq,
+                                        packet, (uint16_t)n, NULL);
+            }
         }
         if (sent <= 0) {
             e->vpn.dropped_packets++;
@@ -2484,8 +3559,11 @@ static void client_send_data(engine_t *e, uint64_t now, uint64_t dt_ms) {
         if (payload_len > ST_MAX_PAYLOAD) {
             payload_len = ST_MAX_PAYLOAD;
         }
+        if (p->proto == PATH_DNS && payload_len > ST_DNS_FRAG_DATA) {
+            payload_len = ST_DNS_FRAG_DATA;
+        }
         if (payload_len < 64) {
-            payload_len = 64;
+            payload_len = p->proto == PATH_DNS ? ST_DNS_FRAG_DATA : 64;
         }
         seq = e->seq++;
         for (i = 0; i < payload_len; i++) {
@@ -2508,10 +3586,17 @@ static void engine_tick(engine_t *e, uint64_t now, uint64_t dt_ms) {
 
     if (e->cfg.mode == MODE_SERVER) {
         int budget = e->path_count < ST_SERVER_RECV_BUDGET ? e->path_count : ST_SERVER_RECV_BUDGET;
+        for (i = 0; i < e->path_count; i++) {
+            if (e->paths[i].proto == PATH_DNS) {
+                receive_server_dns(e, &e->paths[i], i, now);
+            }
+        }
         for (i = 0; i < budget; i++) {
             int idx = (e->server_poll_cursor + i) % e->path_count;
             if (e->paths[idx].proto == PATH_TCP) {
                 accept_tcp_server(e, &e->paths[idx], idx, now);
+            } else if (e->paths[idx].proto == PATH_DNS) {
+                continue;
             } else {
                 receive_server(e, &e->paths[idx], idx, now);
             }
@@ -2538,6 +3623,14 @@ static void engine_tick(engine_t *e, uint64_t now, uint64_t dt_ms) {
                 }
                 client_probe_tcp_auto(e, now);
             }
+            if (transport_has_dns(e->cfg.transport)) {
+                for (i = 0; i < e->path_count; i++) {
+                    if (e->paths[i].proto == PATH_DNS) {
+                        receive_client_dns(e, &e->paths[i], now);
+                    }
+                }
+                client_poll_dns(e, now);
+            }
         } else {
             if (transport_has_tcp(e->cfg.transport)) {
                 client_probe_tcp_fixed(e, now);
@@ -2545,11 +3638,16 @@ static void engine_tick(engine_t *e, uint64_t now, uint64_t dt_ms) {
             for (i = 0; i < e->path_count; i++) {
                 if (e->paths[i].proto == PATH_TCP) {
                     receive_client_tcp(e, &e->paths[i], now);
+                } else if (e->paths[i].proto == PATH_DNS) {
+                    receive_client_dns(e, &e->paths[i], now);
                 } else {
                     receive_client(e, &e->paths[i], now);
                 }
             }
             client_send_hello(e, now);
+            if (transport_has_dns(e->cfg.transport)) {
+                client_poll_dns(e, now);
+            }
         }
         if (e->vpn.active) {
             vpn_pump_tun(e, now);
@@ -2608,13 +3706,13 @@ static int term_init(void) {
         g_term_active = 1;
     }
 #endif
-    printf("\x1b[?25l");
+    printf("\x1b[?1049h\x1b[H\x1b[?25l");
     fflush(stdout);
     return 0;
 }
 
 static void term_restore(void) {
-    printf("\x1b[0m\x1b[?25h\n");
+    printf("\x1b[0m\x1b[?25h\x1b[?1049l\n");
     fflush(stdout);
 #ifndef _WIN32
     if (g_term_active) {
@@ -2698,6 +3796,9 @@ static void draw_tui(const engine_t *e, int selected, const char *prompt, const 
         "Mode",
         "Transport",
         "VPN",
+        "IPv6",
+        "DNS Domain",
+        "DNS Resolver",
         "Server IP",
         "Ports",
         "Token",
@@ -2714,7 +3815,7 @@ static void draw_tui(const engine_t *e, int selected, const char *prompt, const 
     scan_done = (!transport_has_udp(e->cfg.transport) || e->udp_scan_complete) &&
                 (!transport_has_tcp(e->cfg.transport) || e->tcp_scan_complete);
 
-    printf("\x1b[H\x1b[2J");
+    printf("\x1b[H");
     draw_line("\x1b[38;5;45m", " sloptunnel");
     draw_line("\x1b[38;5;240m", " -----------------------------------------------");
     printf(" \x1b[38;5;252mMode:\x1b[0m %-8s  \x1b[38;5;252mTransport:\x1b[0m %-5s  \x1b[38;5;252mState:\x1b[0m %-8s  \x1b[38;5;252mPeers:\x1b[0m %d\n",
@@ -2743,14 +3844,20 @@ static void draw_tui(const engine_t *e, int selected, const char *prompt, const 
         } else if (i == 2) {
             printf("%s%s\n", e->cfg.vpn_enabled ? "Full tunnel" : "Benchmark", tail);
         } else if (i == 3) {
-            printf("%s%s\n", e->cfg.server_ip, tail);
+            printf("%s%s\n", e->cfg.ipv6_enabled ? "enabled" : "disabled", tail);
         } else if (i == 4) {
-            printf("%s%s\n", ports, tail);
+            printf("%s%s\n", e->cfg.dns_tunnel_domain, tail);
         } else if (i == 5) {
-            printf("%s%s\n", e->cfg.token[0] ? "set" : "empty", tail);
+            printf("%s%s\n", e->cfg.dns_tunnel_resolver[0] ? e->cfg.dns_tunnel_resolver : e->cfg.server_ip, tail);
         } else if (i == 6) {
-            printf("%.2f Mbps%s\n", e->cfg.rate_mbps, tail);
+            printf("%s%s\n", e->cfg.server_ip, tail);
         } else if (i == 7) {
+            printf("%s%s\n", ports, tail);
+        } else if (i == 8) {
+            printf("%s%s\n", e->cfg.token[0] ? "set" : "empty", tail);
+        } else if (i == 9) {
+            printf("%.2f Mbps%s\n", e->cfg.rate_mbps, tail);
+        } else if (i == 10) {
             printf("%s%s\n", e->running ? "Stop" : "Start", tail);
         } else {
             printf("%s\n", tail);
@@ -2771,9 +3878,9 @@ static void draw_tui(const engine_t *e, int selected, const char *prompt, const 
     }
 
     if (prompt) {
-        printf("\n \x1b[38;5;220m%s\x1b[0m %s\x1b[?25h", prompt, input ? input : "");
+        printf("\n \x1b[38;5;220m%s\x1b[0m %s\x1b[?25h\x1b[J", prompt, input ? input : "");
     } else {
-        printf("\n \x1b[38;5;240mArrows select, Enter edits/toggles, q quits.\x1b[0m");
+        printf("\n \x1b[38;5;240mArrows select, Enter edits/toggles, q quits.\x1b[0m\x1b[J");
     }
     fflush(stdout);
 }
@@ -2835,7 +3942,11 @@ static void handle_menu_enter(engine_t *e, int selected) {
         if (e->cfg.transport == TRANSPORT_UDP) {
             e->cfg.transport = TRANSPORT_TCP;
         } else if (e->cfg.transport == TRANSPORT_TCP) {
+            e->cfg.transport = TRANSPORT_DNS;
+        } else if (e->cfg.transport == TRANSPORT_DNS) {
             e->cfg.transport = TRANSPORT_BOTH;
+        } else if (e->cfg.transport == TRANSPORT_BOTH) {
+            e->cfg.transport = TRANSPORT_ALL;
         } else {
             e->cfg.transport = TRANSPORT_UDP;
         }
@@ -2844,11 +3955,25 @@ static void handle_menu_enter(engine_t *e, int selected) {
         e->cfg.vpn_enabled = !e->cfg.vpn_enabled;
         set_status(e, "VPN mode %s", e->cfg.vpn_enabled ? "enabled" : "disabled");
     } else if (selected == 3 && !e->running) {
+        e->cfg.ipv6_enabled = !e->cfg.ipv6_enabled;
+        set_status(e, "IPv6 %s", e->cfg.ipv6_enabled ? "enabled" : "disabled");
+    } else if (selected == 4 && !e->running) {
+        if (prompt_text(e, selected, "DNS tunnel domain:", e->cfg.dns_tunnel_domain, input, sizeof(input)) == 0 && input[0]) {
+            copy_text(e->cfg.dns_tunnel_domain, sizeof(e->cfg.dns_tunnel_domain), input);
+            normalize_domain(e->cfg.dns_tunnel_domain);
+            set_status(e, "DNS tunnel domain set");
+        }
+    } else if (selected == 5 && !e->running) {
+        if (prompt_text(e, selected, "DNS resolver/server IP:", e->cfg.dns_tunnel_resolver, input, sizeof(input)) == 0 && input[0]) {
+            copy_text(e->cfg.dns_tunnel_resolver, sizeof(e->cfg.dns_tunnel_resolver), input);
+            set_status(e, "DNS resolver set");
+        }
+    } else if (selected == 6 && !e->running) {
         if (prompt_text(e, selected, "Server IP:", e->cfg.server_ip, input, sizeof(input)) == 0 && input[0]) {
             copy_text(e->cfg.server_ip, sizeof(e->cfg.server_ip), input);
             set_status(e, "Server IP set");
         }
-    } else if (selected == 4 && !e->running) {
+    } else if (selected == 7 && !e->running) {
         ports_to_string(&e->cfg, current, sizeof(current));
         if (prompt_text(e, selected, "Ports (auto, auto:1-65535, or list):", current, input, sizeof(input)) == 0) {
             if (parse_port_setting(input, &e->cfg) == 0) {
@@ -2857,12 +3982,12 @@ static void handle_menu_enter(engine_t *e, int selected) {
                 set_status(e, "Invalid port setting");
             }
         }
-    } else if (selected == 5 && !e->running) {
+    } else if (selected == 8 && !e->running) {
         if (prompt_text(e, selected, "Shared token:", e->cfg.token, input, sizeof(input)) == 0 && input[0]) {
             copy_text(e->cfg.token, sizeof(e->cfg.token), input);
             set_status(e, "Token updated");
         }
-    } else if (selected == 6 && !e->running) {
+    } else if (selected == 9 && !e->running) {
         snprintf(current, sizeof(current), "%.2f", e->cfg.rate_mbps);
         if (prompt_text(e, selected, "Rate Mbps:", current, input, sizeof(input)) == 0) {
             double v = strtod(input, NULL);
@@ -2873,13 +3998,13 @@ static void handle_menu_enter(engine_t *e, int selected) {
                 set_status(e, "Invalid rate");
             }
         }
-    } else if (selected == 7) {
+    } else if (selected == 10) {
         if (e->running) {
             engine_stop(e);
         } else if (engine_start(e) != 0) {
             e->running = 0;
         }
-    } else if (selected == 8) {
+    } else if (selected == 11) {
         g_stop = 1;
     } else if (e->running) {
         set_status(e, "Stop before editing settings");
@@ -2981,16 +4106,19 @@ static int run_headless(config_t cfg) {
 
 static void usage(const char *argv0) {
     printf("usage: %s [--client|--server] [--server-ip IP] [--ports auto|auto:A-B|LIST]\n", argv0);
-    printf("          [--transport udp|tcp|both] [--auto-range A-B] [--max-auto-ports N]\n");
+    printf("          [--transport udp|tcp|dns|both|all|udp+dns|tcp+dns]\n");
+    printf("          [--auto-range A-B] [--max-auto-ports N]\n");
     printf("          [--vpn|--no-vpn] [--no-route] [--tun-name NAME] [--tun-mtu N]\n");
     printf("          [--tun-server-ip IP] [--tun-client-ip IP] [--tun-cidr CIDR]\n");
-    printf("          [--dns-server IP|--no-dns]\n");
+    printf("          [--ipv6|--no-ipv6] [--tun-server-ip6 IP] [--tun-client-ip6 IP] [--tun-cidr6 CIDR]\n");
+    printf("          [--dns-server IP|--no-dns] [--dns-tunnel-domain DOMAIN] [--dns-resolver IP]\n");
     printf("          [--token TOKEN|--token-file PATH]\n");
     printf("          [--rate-mbps N] [--headless] [--help]\n\n");
     printf("examples:\n");
     printf("  %s\n", argv0);
-    printf("  %s --server --transport both --ports auto --token secret --headless\n", argv0);
-    printf("  %s --client --server-ip 18.219.84.252 --transport both --ports auto --token secret --headless\n", argv0);
+    printf("  %s --server --transport all --ports auto --token secret --headless\n", argv0);
+    printf("  %s --client --server-ip 18.219.84.252 --transport all --ports auto --token secret --headless\n", argv0);
+    printf("  %s --client --transport dns --dns-tunnel-domain sploinkstersploinkster.online --headless\n", argv0);
     printf("  %s --server --transport tcp --ports auto:1-1024 --headless\n", argv0);
 }
 
@@ -3007,11 +4135,21 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
             cfg->vpn_enabled = 0;
         } else if (strcmp(argv[i], "--no-route") == 0) {
             cfg->route_all = 0;
+        } else if (strcmp(argv[i], "--ipv6") == 0) {
+            cfg->ipv6_enabled = 1;
+        } else if (strcmp(argv[i], "--no-ipv6") == 0) {
+            cfg->ipv6_enabled = 0;
         } else if (strcmp(argv[i], "--no-dns") == 0) {
             cfg->dns_enabled = 0;
         } else if (strcmp(argv[i], "--dns-server") == 0 && i + 1 < argc) {
             copy_text(cfg->dns_server, sizeof(cfg->dns_server), argv[++i]);
             cfg->dns_enabled = 1;
+        } else if (strcmp(argv[i], "--dns-tunnel-domain") == 0 && i + 1 < argc) {
+            copy_text(cfg->dns_tunnel_domain, sizeof(cfg->dns_tunnel_domain), argv[++i]);
+            normalize_domain(cfg->dns_tunnel_domain);
+        } else if ((strcmp(argv[i], "--dns-resolver") == 0 ||
+                    strcmp(argv[i], "--dns-tunnel-resolver") == 0) && i + 1 < argc) {
+            copy_text(cfg->dns_tunnel_resolver, sizeof(cfg->dns_tunnel_resolver), argv[++i]);
         } else if (strcmp(argv[i], "--tun-name") == 0 && i + 1 < argc) {
             copy_text(cfg->tun_name, sizeof(cfg->tun_name), argv[++i]);
         } else if (strcmp(argv[i], "--tun-server-ip") == 0 && i + 1 < argc) {
@@ -3020,6 +4158,12 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
             copy_text(cfg->tun_client_ip, sizeof(cfg->tun_client_ip), argv[++i]);
         } else if (strcmp(argv[i], "--tun-cidr") == 0 && i + 1 < argc) {
             copy_text(cfg->tun_cidr, sizeof(cfg->tun_cidr), argv[++i]);
+        } else if (strcmp(argv[i], "--tun-server-ip6") == 0 && i + 1 < argc) {
+            copy_text(cfg->tun_server_ip6, sizeof(cfg->tun_server_ip6), argv[++i]);
+        } else if (strcmp(argv[i], "--tun-client-ip6") == 0 && i + 1 < argc) {
+            copy_text(cfg->tun_client_ip6, sizeof(cfg->tun_client_ip6), argv[++i]);
+        } else if (strcmp(argv[i], "--tun-cidr6") == 0 && i + 1 < argc) {
+            copy_text(cfg->tun_cidr6, sizeof(cfg->tun_cidr6), argv[++i]);
         } else if (strcmp(argv[i], "--tun-mtu") == 0 && i + 1 < argc) {
             cfg->tun_mtu = atoi(argv[++i]);
             if (cfg->tun_mtu < 576 || cfg->tun_mtu > ST_MAX_PAYLOAD) {
