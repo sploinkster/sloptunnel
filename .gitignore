@@ -1,0 +1,9 @@
+build/
+keys/
+*.o
+*.obj
+*.exe
+*.log
+*.pid
+runtime/
+
