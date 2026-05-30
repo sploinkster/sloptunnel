@@ -23,14 +23,17 @@ ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$
 
 if [[ "$USE_SUDO" == "1" ]]; then
   ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
-    "sudo pkill -x sloptunnel >/dev/null 2>&1 || true"
+    "sudo pkill -x sloptunnel >/dev/null 2>&1 || true; sleep 1"
 else
   ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
-    "pkill -x sloptunnel >/dev/null 2>&1 || true"
+    "pkill -x sloptunnel >/dev/null 2>&1 || true; sleep 1"
 fi
 
 scp -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-  build/sloptunnel "$USER_NAME@$HOST:$REMOTE_DIR/sloptunnel"
+  build/sloptunnel "$USER_NAME@$HOST:$REMOTE_DIR/sloptunnel.tmp"
+
+ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
+  "mv '$REMOTE_DIR/sloptunnel.tmp' '$REMOTE_DIR/sloptunnel'"
 
 scp -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
   "$LOCAL_TOKEN_FILE" "$USER_NAME@$HOST:$REMOTE_DIR/token"
