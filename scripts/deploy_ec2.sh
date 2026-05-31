@@ -37,7 +37,9 @@ ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$
 
 if [[ "$USE_SUDO" == "1" ]]; then
   ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
-    "sudo pkill -x sloptunnel >/dev/null 2>&1 || true; sleep 1"
+    "sudo pkill -x sloptunnel >/dev/null 2>&1 || true; sleep 1; \
+     sudo pkill -9 -x sloptunnel >/dev/null 2>&1 || true; \
+     sudo ip link del sloptun0 >/dev/null 2>&1 || true"
 else
   ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
     "pkill -x sloptunnel >/dev/null 2>&1 || true; sleep 1"
@@ -70,5 +72,15 @@ else
      --token-file '$REMOTE_DIR/token' --headless \
      > '$REMOTE_DIR/server.log' 2>&1 &)"
 fi
+
+ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
+  "sleep 2; pgrep -x sloptunnel >/dev/null"
+
+case "$TRANSPORT" in
+  dns|udp+dns|tcp+dns|all)
+    ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$USER_NAME@$HOST" \
+      "sudo ss -H -lunp 'sport = :53' | grep -q sloptunnel"
+    ;;
+esac
 
 echo "sloptunnel server started on $HOST transport $TRANSPORT ports $PORTS dns-domain $DNS_DOMAIN"
