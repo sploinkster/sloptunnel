@@ -143,6 +143,16 @@ typedef enum {
     KEY_CHAR
 } key_type_t;
 
+typedef enum {
+    TUI_PAGE_MAIN = 0,
+    TUI_PAGE_TRANSPORT,
+    TUI_PAGE_PORTS,
+    TUI_PAGE_DNS,
+    TUI_PAGE_CONNECTION,
+    TUI_PAGE_TUNNEL,
+    TUI_PAGE_RUNTIME
+} tui_page_t;
+
 typedef struct {
     key_type_t type;
     int ch;
@@ -669,7 +679,8 @@ static int parse_transport(const char *text, transport_t *transport) {
         *transport = TRANSPORT_DNS;
         return 0;
     }
-    if (strcmp(text, "both") == 0 || strcmp(text, "all") == 0) {
+    if (strcmp(text, "both") == 0 || strcmp(text, "udp+tcp") == 0 ||
+        strcmp(text, "all") == 0) {
         *transport = strcmp(text, "all") == 0 ? TRANSPORT_ALL : TRANSPORT_BOTH;
         return 0;
     }
@@ -713,7 +724,7 @@ static const char *transport_name(transport_t transport) {
         return "tcp";
     }
     if (transport == TRANSPORT_BOTH) {
-        return "both";
+        return "udp+tcp";
     }
     return "udp";
 }
@@ -3802,111 +3813,322 @@ static void draw_line(const char *color, const char *fmt, ...) {
     va_start(ap, fmt);
     vprintf(fmt, ap);
     va_end(ap);
-    printf("\x1b[0m\n");
+    printf("\x1b[0m\x1b[K\n");
 }
 
-static void draw_tui(const engine_t *e, int selected, const char *prompt, const char *input) {
+static const char *tui_page_name(tui_page_t page) {
+    if (page == TUI_PAGE_TRANSPORT) {
+        return "Transport";
+    }
+    if (page == TUI_PAGE_PORTS) {
+        return "Port Scan";
+    }
+    if (page == TUI_PAGE_DNS) {
+        return "DNS Tunnel";
+    }
+    if (page == TUI_PAGE_CONNECTION) {
+        return "Connection";
+    }
+    if (page == TUI_PAGE_TUNNEL) {
+        return "Tunnel";
+    }
+    if (page == TUI_PAGE_RUNTIME) {
+        return "Runtime";
+    }
+    return "Main";
+}
+
+static tui_page_t tui_parent_page(tui_page_t page) {
+    if (page == TUI_PAGE_PORTS || page == TUI_PAGE_DNS) {
+        return TUI_PAGE_TRANSPORT;
+    }
+    return TUI_PAGE_MAIN;
+}
+
+static int tui_item_count(tui_page_t page) {
+    if (page == TUI_PAGE_MAIN) {
+        return 6;
+    }
+    if (page == TUI_PAGE_TRANSPORT) {
+        return 4;
+    }
+    if (page == TUI_PAGE_PORTS) {
+        return 5;
+    }
+    if (page == TUI_PAGE_DNS) {
+        return 3;
+    }
+    if (page == TUI_PAGE_CONNECTION) {
+        return 5;
+    }
+    if (page == TUI_PAGE_TUNNEL) {
+        return 6;
+    }
+    return 1;
+}
+
+static void cycle_transport(config_t *cfg) {
+    if (cfg->transport == TRANSPORT_UDP) {
+        cfg->transport = TRANSPORT_TCP;
+    } else if (cfg->transport == TRANSPORT_TCP) {
+        cfg->transport = TRANSPORT_DNS;
+    } else if (cfg->transport == TRANSPORT_DNS) {
+        cfg->transport = TRANSPORT_BOTH;
+    } else if (cfg->transport == TRANSPORT_BOTH) {
+        cfg->transport = (transport_t)(TRANSPORT_UDP | TRANSPORT_DNS);
+    } else if (cfg->transport == (transport_t)(TRANSPORT_UDP | TRANSPORT_DNS)) {
+        cfg->transport = (transport_t)(TRANSPORT_TCP | TRANSPORT_DNS);
+    } else if (cfg->transport == (transport_t)(TRANSPORT_TCP | TRANSPORT_DNS)) {
+        cfg->transport = TRANSPORT_ALL;
+    } else {
+        cfg->transport = TRANSPORT_UDP;
+    }
+}
+
+static void tui_item_text(const engine_t *e, tui_page_t page, int selected,
+                          char *label, size_t label_len, char *value, size_t value_len,
+                          char *desc, size_t desc_len) {
     char ports[256];
-    char tx[64];
-    char rx[64];
-    char tun_in[64];
-    char tun_out[64];
-    int i;
-    int scan_done;
-    const char *items[ST_MAX_MENU] = {
-        "Mode",
-        "Transport",
-        "VPN",
-        "IPv6",
-        "DNS Domain",
-        "DNS Resolver",
-        "Server IP",
-        "Ports",
-        "Token",
-        "Rate",
-        "Start/Stop",
-        "Quit"
-    };
-
     ports_to_string(&e->cfg, ports, sizeof(ports));
-    fmt_rate(e->tx_bps, tx, sizeof(tx));
-    fmt_rate(e->rx_bps, rx, sizeof(rx));
-    fmt_rate(e->vpn.tun_in_bps, tun_in, sizeof(tun_in));
-    fmt_rate(e->vpn.tun_out_bps, tun_out, sizeof(tun_out));
-    scan_done = (!transport_has_udp(e->cfg.transport) || e->udp_scan_complete) &&
-                (!transport_has_tcp(e->cfg.transport) || e->tcp_scan_complete);
+    label[0] = value[0] = desc[0] = '\0';
 
-    printf("\x1b[H");
-    draw_line("\x1b[38;5;45m", " sloptunnel");
-    draw_line("\x1b[38;5;240m", " -----------------------------------------------");
-    printf(" \x1b[38;5;252mMode:\x1b[0m %-8s  \x1b[38;5;252mTransport:\x1b[0m %-5s  \x1b[38;5;252mState:\x1b[0m %-8s  \x1b[38;5;252mPeers:\x1b[0m %d\n",
-           mode_name(e->cfg.mode), transport_name(e->cfg.transport),
-           e->running ? "running" : "stopped", e->active_peers);
-    printf(" \x1b[38;5;252mServer:\x1b[0m %-15s  \x1b[38;5;252mPorts:\x1b[0m %s\n",
-           e->cfg.server_ip, ports);
-    printf(" \x1b[38;5;252mPaths:\x1b[0m %-5d  \x1b[38;5;252mCapacity:\x1b[0m %-5d  \x1b[38;5;252mScan:\x1b[0m %s\n",
-           e->path_count, e->path_capacity,
-           e->cfg.auto_ports ? (scan_done ? "cycling" : "probing") : "fixed");
-    printf(" \x1b[38;5;252mTX:\x1b[0m %-14s  \x1b[38;5;252mRX:\x1b[0m %-14s  \x1b[38;5;252mTotal:\x1b[0m %" PRIu64 " / %" PRIu64 " bytes\n",
-           tx, rx, e->total_tx, e->total_rx);
-    printf(" \x1b[38;5;252mVPN:\x1b[0m %-8s  \x1b[38;5;252mTUN in:\x1b[0m %-12s \x1b[38;5;252mTUN out:\x1b[0m %-12s \x1b[38;5;252mDrop:\x1b[0m %" PRIu64 "\n",
-           e->cfg.vpn_enabled ? (e->vpn.active ? "active" : "enabled") : "off",
-           tun_in, tun_out, e->vpn.dropped_packets);
-    printf(" \x1b[38;5;245m%s\x1b[0m\n\n", e->status[0] ? e->status : "Ready");
-
-    for (i = 0; i < ST_MAX_MENU; i++) {
-        const char *cursor = i == selected ? "\x1b[48;5;24m\x1b[38;5;231m > " : "   ";
-        const char *tail = i == selected ? "\x1b[0m" : "";
-        printf("%s%-12s", cursor, items[i]);
-        if (i == 0) {
-            printf("%s%s\n", mode_name(e->cfg.mode), tail);
-        } else if (i == 1) {
-            printf("%s%s\n", transport_name(e->cfg.transport), tail);
-        } else if (i == 2) {
-            printf("%s%s\n", e->cfg.vpn_enabled ? "Full tunnel" : "Benchmark", tail);
-        } else if (i == 3) {
-            printf("%s%s\n", e->cfg.ipv6_enabled ? "enabled" : "disabled", tail);
-        } else if (i == 4) {
-            printf("%s%s\n", e->cfg.dns_tunnel_domain, tail);
-        } else if (i == 5) {
-            printf("%s%s\n", e->cfg.dns_tunnel_resolver[0] ? e->cfg.dns_tunnel_resolver : e->cfg.server_ip, tail);
-        } else if (i == 6) {
-            printf("%s%s\n", e->cfg.server_ip, tail);
-        } else if (i == 7) {
-            printf("%s%s\n", ports, tail);
-        } else if (i == 8) {
-            printf("%s%s\n", e->cfg.token[0] ? "set" : "empty", tail);
-        } else if (i == 9) {
-            printf("%.2f Mbps%s\n", e->cfg.rate_mbps, tail);
-        } else if (i == 10) {
-            printf("%s%s\n", e->running ? "Stop" : "Start", tail);
+    if (page == TUI_PAGE_MAIN) {
+        if (selected == 0) {
+            copy_text(label, label_len, "Transport");
+            copy_text(value, value_len, transport_name(e->cfg.transport));
+            copy_text(desc, desc_len, "Open protocol settings. Names are udp, tcp, dns, udp+tcp, udp+dns, tcp+dns, or all; there is no trailing h.");
+        } else if (selected == 1) {
+            copy_text(label, label_len, "Connection");
+            copy_text(value, value_len, e->cfg.server_ip);
+            copy_text(desc, desc_len, "Open endpoint settings: client/server role, EC2/server IP, shared token, and benchmark rate.");
+        } else if (selected == 2) {
+            copy_text(label, label_len, "Tunnel / VPN");
+            copy_text(value, value_len, e->cfg.vpn_enabled ? "full tunnel" : "benchmark");
+            copy_text(desc, desc_len, "Open OS routing and adapter settings. Full tunnel routes normal traffic through the tunnel.");
+        } else if (selected == 3) {
+            copy_text(label, label_len, "Runtime");
+            snprintf(value, value_len, "%d/%d paths", e->path_count, e->path_capacity);
+            copy_text(desc, desc_len, "Open live path counters and per-transport bandwidth details.");
+        } else if (selected == 4) {
+            copy_text(label, label_len, e->running ? "Stop" : "Start");
+            copy_text(value, value_len, e->running ? "running" : "stopped");
+            copy_text(desc, desc_len, e->running ? "Stop the current client/server engine and restore routes." : "Start with the current settings.");
         } else {
-            printf("%s\n", tail);
+            copy_text(label, label_len, "Quit");
+            copy_text(value, value_len, "");
+            copy_text(desc, desc_len, "Exit the TUI. Running tunnels are stopped before exit.");
         }
+        return;
     }
 
-    printf("\n \x1b[38;5;245mPort status%s\x1b[0m\n",
+    if (page == TUI_PAGE_TRANSPORT) {
+        if (selected == 0) {
+            copy_text(label, label_len, "Protocol set");
+            copy_text(value, value_len, transport_name(e->cfg.transport));
+            copy_text(desc, desc_len, "Select which carriers are used. Stacked choices send traffic across multiple methods for more aggregate bandwidth.");
+        } else if (selected == 1) {
+            copy_text(label, label_len, "Port scan");
+            copy_text(value, value_len, e->cfg.auto_ports ? "auto scan" : "fixed list");
+            copy_text(desc, desc_len, "Open outbound UDP/TCP scan settings. Auto scan means you do not have to manually test thousands of ports.");
+        } else if (selected == 2) {
+            copy_text(label, label_len, "DNS tunnel");
+            copy_text(value, value_len, e->cfg.dns_tunnel_domain);
+            copy_text(desc, desc_len, "Open DNS tunnel domain and resolver settings.");
+        } else {
+            copy_text(label, label_len, "Back");
+            copy_text(value, value_len, "");
+            copy_text(desc, desc_len, "Return to the main page.");
+        }
+        return;
+    }
+
+    if (page == TUI_PAGE_PORTS) {
+        if (selected == 0) {
+            copy_text(label, label_len, "Scan mode");
+            copy_text(value, value_len, e->cfg.auto_ports ? "auto scan" : "fixed list");
+            copy_text(desc, desc_len, "Auto scan probes the configured range and keeps ports that answer with the tunnel token. Fixed list only tries the ports you enter.");
+        } else if (selected == 1) {
+            copy_text(label, label_len, "Scan range");
+            snprintf(value, value_len, "%u-%u", (unsigned)e->cfg.range_start,
+                     (unsigned)e->cfg.range_end);
+            copy_text(desc, desc_len, "Range used by auto scan for UDP/TCP outbound connectivity. Example: 1-1024 or 80-9000.");
+        } else if (selected == 2) {
+            copy_text(label, label_len, "Fixed ports");
+            copy_text(value, value_len, e->cfg.auto_ports ? "not used" : (ports[0] ? ports : "empty"));
+            copy_text(desc, desc_len, "Explicit masquerade ports when scan mode is fixed. Example: 80,443,5223.");
+        } else if (selected == 3) {
+            copy_text(label, label_len, "Max paths");
+            snprintf(value, value_len, "%d", e->cfg.max_auto_ports);
+            copy_text(desc, desc_len, "Maximum number of scanned ports kept in memory per transport. Lower this if you only need the first working paths.");
+        } else {
+            copy_text(label, label_len, "Back");
+            copy_text(value, value_len, "");
+            copy_text(desc, desc_len, "Return to the Transport page.");
+        }
+        return;
+    }
+
+    if (page == TUI_PAGE_DNS) {
+        if (selected == 0) {
+            copy_text(label, label_len, "Domain");
+            copy_text(value, value_len, e->cfg.dns_tunnel_domain);
+            copy_text(desc, desc_len, "Authoritative domain used for DNS tunneling. TXT queries carry authenticated tunnel frames under this zone.");
+        } else if (selected == 1) {
+            copy_text(label, label_len, "Resolver");
+            copy_text(value, value_len, e->cfg.dns_tunnel_resolver[0] ? e->cfg.dns_tunnel_resolver : e->cfg.server_ip);
+            copy_text(desc, desc_len, "Resolver IP used by the client for DNS tunnel queries. Behind a firewall this is usually the allowed DNS resolver.");
+        } else {
+            copy_text(label, label_len, "Back");
+            copy_text(value, value_len, "");
+            copy_text(desc, desc_len, "Return to the Transport page.");
+        }
+        return;
+    }
+
+    if (page == TUI_PAGE_CONNECTION) {
+        if (selected == 0) {
+            copy_text(label, label_len, "Role");
+            copy_text(value, value_len, mode_name(e->cfg.mode));
+            copy_text(desc, desc_len, "Client runs on this machine and connects out. Server listens and forwards tunneled packets.");
+        } else if (selected == 1) {
+            copy_text(label, label_len, "Server IP");
+            copy_text(value, value_len, e->cfg.server_ip);
+            copy_text(desc, desc_len, "Remote server address used by clients and DNS zone responses.");
+        } else if (selected == 2) {
+            copy_text(label, label_len, "Token");
+            copy_text(value, value_len, e->cfg.token[0] ? "set" : "empty");
+            copy_text(desc, desc_len, "Shared secret used to authenticate tunnel frames. Client and server must use the same token.");
+        } else if (selected == 3) {
+            copy_text(label, label_len, "Rate");
+            snprintf(value, value_len, "%.2f Mbps", e->cfg.rate_mbps);
+            copy_text(desc, desc_len, "Benchmark sender target rate when VPN mode is off. It does not cap normal full-tunnel traffic.");
+        } else {
+            copy_text(label, label_len, "Back");
+            copy_text(value, value_len, "");
+            copy_text(desc, desc_len, "Return to the main page.");
+        }
+        return;
+    }
+
+    if (page == TUI_PAGE_TUNNEL) {
+        if (selected == 0) {
+            copy_text(label, label_len, "VPN mode");
+            copy_text(value, value_len, e->cfg.vpn_enabled ? "full tunnel" : "benchmark");
+            copy_text(desc, desc_len, "Full tunnel creates a TUN/Wintun adapter. Benchmark mode only sends synthetic test traffic.");
+        } else if (selected == 1) {
+            copy_text(label, label_len, "Route all");
+            copy_text(value, value_len, e->cfg.route_all ? "enabled" : "disabled");
+            copy_text(desc, desc_len, "When enabled, client default routes are split through the tunnel while preserving a direct route to the server.");
+        } else if (selected == 2) {
+            copy_text(label, label_len, "IPv6");
+            copy_text(value, value_len, e->cfg.ipv6_enabled ? "enabled" : "disabled");
+            copy_text(desc, desc_len, "Adds IPv6 tunnel addresses and routes in addition to IPv4 where supported.");
+        } else if (selected == 3) {
+            copy_text(label, label_len, "Adapter name");
+            copy_text(value, value_len, e->cfg.tun_name);
+            copy_text(desc, desc_len, "Name for the Linux TUN device or Windows Wintun adapter.");
+        } else if (selected == 4) {
+            copy_text(label, label_len, "Tunnel DNS");
+            copy_text(value, value_len, e->cfg.dns_enabled ? e->cfg.dns_server : "disabled");
+            copy_text(desc, desc_len, "DNS server assigned to the tunnel adapter in full-tunnel client mode. Enter an empty value to disable it.");
+        } else {
+            copy_text(label, label_len, "Back");
+            copy_text(value, value_len, "");
+            copy_text(desc, desc_len, "Return to the main page.");
+        }
+        return;
+    }
+
+    copy_text(label, label_len, "Back");
+    copy_text(value, value_len, "");
+    copy_text(desc, desc_len, "Return to the main page.");
+}
+
+static void draw_runtime_paths(const engine_t *e) {
+    int i;
+    printf(" \x1b[38;5;245mPaths%s\x1b[0m\x1b[K\n\x1b[K\n",
            e->path_count > ST_MAX_MENU_PATHS ? " (first 16)" : "");
+    if (e->path_count == 0) {
+        printf("   No active paths yet.\x1b[K\n\x1b[K\n");
+        return;
+    }
     for (i = 0; i < e->path_count && i < ST_MAX_MENU_PATHS; i++) {
         char ptx[64];
         char prx[64];
         fmt_rate(e->paths[i].tx_bps, ptx, sizeof(ptx));
         fmt_rate(e->paths[i].rx_bps, prx, sizeof(prx));
-        printf("  \x1b[38;5;252m%3s:%-5u\x1b[0m tx %-12s rx %-12s pkts %" PRIu64 "/%" PRIu64 " rtt %.0fms %s\n",
+        printf("   \x1b[38;5;252m%-3s %-5u\x1b[0m  tx %-12s  rx %-12s  rtt %6.0fms  %s\x1b[K\n",
                proto_name(e->paths[i].proto), (unsigned)e->paths[i].port, ptx, prx,
-               e->paths[i].tx_packets, e->paths[i].rx_packets,
                e->paths[i].rtt_ms, e->paths[i].healthy ? "\x1b[38;5;42mup\x1b[0m" : "\x1b[38;5;196mdown\x1b[0m");
     }
+    printf("\x1b[K\n");
+}
+
+static void draw_tui(const engine_t *e, tui_page_t page, int selected,
+                     const char *prompt, const char *input) {
+    char tx[64];
+    char rx[64];
+    char tun_in[64];
+    char tun_out[64];
+    char label[48];
+    char value[256];
+    char desc[320];
+    int i;
+    int count = tui_item_count(page);
+
+    fmt_rate(e->tx_bps, tx, sizeof(tx));
+    fmt_rate(e->rx_bps, rx, sizeof(rx));
+    fmt_rate(e->vpn.tun_in_bps, tun_in, sizeof(tun_in));
+    fmt_rate(e->vpn.tun_out_bps, tun_out, sizeof(tun_out));
+    if (selected < 0 || selected >= count) {
+        selected = 0;
+    }
+    tui_item_text(e, page, selected, label, sizeof(label), value, sizeof(value),
+                  desc, sizeof(desc));
+
+    printf("\x1b[H");
+    draw_line("\x1b[38;5;45m", " sloptunnel");
+    printf(" \x1b[38;5;240m%s\x1b[0m\x1b[K\n\x1b[K\n", tui_page_name(page));
+
+    printf("   \x1b[38;5;252mState\x1b[0m       %-10s   \x1b[38;5;252mRole\x1b[0m %-8s   \x1b[38;5;252mTransport\x1b[0m %s\x1b[K\n",
+           e->running ? "running" : "stopped", mode_name(e->cfg.mode),
+           transport_name(e->cfg.transport));
+    printf("   \x1b[38;5;252mTX/RX\x1b[0m       %-12s / %-12s   \x1b[38;5;252mPaths\x1b[0m %d/%d\x1b[K\n",
+           tx, rx, e->path_count, e->path_capacity);
+    printf("   \x1b[38;5;252mVPN I/O\x1b[0m     %-12s / %-12s   \x1b[38;5;252mDrops\x1b[0m %" PRIu64 "\x1b[K\n\x1b[K\n",
+           tun_in, tun_out, e->vpn.dropped_packets);
+    printf("   \x1b[38;5;245m%s\x1b[0m\x1b[K\n\x1b[K\n", e->status[0] ? e->status : "Ready");
+
+    if (page == TUI_PAGE_RUNTIME) {
+        draw_runtime_paths(e);
+    }
+
+    for (i = 0; i < count; i++) {
+        char row_label[48];
+        char row_value[256];
+        char row_desc[320];
+        const char *cursor = i == selected ? "\x1b[48;5;24m\x1b[38;5;231m > " : "   ";
+        const char *tail = i == selected ? "\x1b[0m" : "";
+        tui_item_text(e, page, i, row_label, sizeof(row_label),
+                      row_value, sizeof(row_value), row_desc, sizeof(row_desc));
+        (void)row_desc;
+        printf("%s%-18s %-42s%s\x1b[K\n", cursor, row_label, row_value, tail);
+        if (i < count - 1) {
+            printf("\x1b[K\n");
+        }
+    }
+
+    printf("\x1b[K\n   \x1b[38;5;245m%s\x1b[0m\x1b[K\n\x1b[K\n", desc);
 
     if (prompt) {
-        printf("\n \x1b[38;5;220m%s\x1b[0m %s\x1b[?25h\x1b[J", prompt, input ? input : "");
+        printf("   \x1b[38;5;220m%s\x1b[0m %s\x1b[?25h\x1b[J", prompt, input ? input : "");
     } else {
-        printf("\n \x1b[38;5;240mArrows select, Enter edits/toggles, q quits.\x1b[0m\x1b[J");
+        printf("   \x1b[38;5;240mUp/Down select, Enter open/edit, Left/Esc back, q quit.\x1b[0m\x1b[J");
     }
     fflush(stdout);
 }
 
-static int prompt_text(engine_t *e, int selected, const char *label,
+static int prompt_text(engine_t *e, tui_page_t page, int selected, const char *label,
                        const char *initial, char *out, size_t out_len) {
     char buf[256];
     size_t len = 0;
@@ -3922,7 +4144,7 @@ static int prompt_text(engine_t *e, int selected, const char *label,
         key_event_t ev;
         uint64_t now = now_ms();
         if (now - last > 33) {
-            draw_tui(e, selected, label, buf);
+            draw_tui(e, page, selected, label, buf);
             last = now;
         }
         ev = read_key();
@@ -3952,65 +4174,139 @@ static int prompt_text(engine_t *e, int selected, const char *label,
     }
 }
 
-static void handle_menu_enter(engine_t *e, int selected) {
+static void handle_menu_enter(engine_t *e, tui_page_t *page, int *selected) {
     char input[256];
     char current[256];
+    int item = *selected;
+    int count = tui_item_count(*page);
 
-    if (selected == 0 && !e->running) {
-        e->cfg.mode = e->cfg.mode == MODE_CLIENT ? MODE_SERVER : MODE_CLIENT;
-        set_status(e, "Mode set to %s", mode_name(e->cfg.mode));
-    } else if (selected == 1 && !e->running) {
-        if (e->cfg.transport == TRANSPORT_UDP) {
-            e->cfg.transport = TRANSPORT_TCP;
-        } else if (e->cfg.transport == TRANSPORT_TCP) {
-            e->cfg.transport = TRANSPORT_DNS;
-        } else if (e->cfg.transport == TRANSPORT_DNS) {
-            e->cfg.transport = TRANSPORT_BOTH;
-        } else if (e->cfg.transport == TRANSPORT_BOTH) {
-            e->cfg.transport = TRANSPORT_ALL;
+    if (*page == TUI_PAGE_MAIN) {
+        if (item == 0) {
+            *page = TUI_PAGE_TRANSPORT;
+            *selected = 0;
+        } else if (item == 1) {
+            *page = TUI_PAGE_CONNECTION;
+            *selected = 0;
+        } else if (item == 2) {
+            *page = TUI_PAGE_TUNNEL;
+            *selected = 0;
+        } else if (item == 3) {
+            *page = TUI_PAGE_RUNTIME;
+            *selected = 0;
+        } else if (item == 4) {
+            if (e->running) {
+                engine_stop(e);
+            } else if (engine_start(e) != 0) {
+                e->running = 0;
+            }
         } else {
-            e->cfg.transport = TRANSPORT_UDP;
+            g_stop = 1;
         }
+        return;
+    }
+
+    if (*page == TUI_PAGE_RUNTIME || item == count - 1) {
+        *page = tui_parent_page(*page);
+        *selected = 0;
+        return;
+    }
+
+    if (*page == TUI_PAGE_TRANSPORT && item == 1) {
+        *page = TUI_PAGE_PORTS;
+        *selected = 0;
+        return;
+    }
+
+    if (*page == TUI_PAGE_TRANSPORT && item == 2) {
+        *page = TUI_PAGE_DNS;
+        *selected = 0;
+        return;
+    }
+
+    if (e->running) {
+        set_status(e, "Stop before editing settings");
+        return;
+    }
+
+    if (*page == TUI_PAGE_TRANSPORT && item == 0) {
+        cycle_transport(&e->cfg);
         set_status(e, "Transport set to %s", transport_name(e->cfg.transport));
-    } else if (selected == 2 && !e->running) {
-        e->cfg.vpn_enabled = !e->cfg.vpn_enabled;
-        set_status(e, "VPN mode %s", e->cfg.vpn_enabled ? "enabled" : "disabled");
-    } else if (selected == 3 && !e->running) {
-        e->cfg.ipv6_enabled = !e->cfg.ipv6_enabled;
-        set_status(e, "IPv6 %s", e->cfg.ipv6_enabled ? "enabled" : "disabled");
-    } else if (selected == 4 && !e->running) {
-        if (prompt_text(e, selected, "DNS tunnel domain:", e->cfg.dns_tunnel_domain, input, sizeof(input)) == 0 && input[0]) {
+    } else if (*page == TUI_PAGE_PORTS && item == 0) {
+        e->cfg.auto_ports = !e->cfg.auto_ports;
+        if (e->cfg.auto_ports) {
+            e->cfg.port_count = 0;
+        }
+        set_status(e, "Port scan %s", e->cfg.auto_ports ? "enabled" : "disabled");
+    } else if (*page == TUI_PAGE_PORTS && item == 1) {
+        snprintf(current, sizeof(current), "%u-%u", (unsigned)e->cfg.range_start,
+                 (unsigned)e->cfg.range_end);
+        if (prompt_text(e, *page, item, "Scan range:", current, input, sizeof(input)) == 0) {
+            if (parse_range(input, &e->cfg.range_start, &e->cfg.range_end) == 0) {
+                e->cfg.auto_ports = 1;
+                e->cfg.port_count = 0;
+                set_status(e, "Scan range updated");
+            } else {
+                set_status(e, "Invalid scan range");
+            }
+        }
+    } else if (*page == TUI_PAGE_PORTS && item == 2) {
+        uint16_t parsed[ST_MAX_CONFIG_PORTS];
+        int parsed_count = 0;
+        if (e->cfg.auto_ports) {
+            current[0] = '\0';
+        } else {
+            ports_to_string(&e->cfg, current, sizeof(current));
+        }
+        if (prompt_text(e, *page, item, "Fixed ports:", current, input, sizeof(input)) == 0) {
+            if (parse_ports(input, parsed, &parsed_count) == 0) {
+                memcpy(e->cfg.ports, parsed, (size_t)parsed_count * sizeof(parsed[0]));
+                e->cfg.port_count = parsed_count;
+                e->cfg.auto_ports = 0;
+                set_status(e, "Fixed ports updated");
+            } else {
+                set_status(e, "Invalid fixed port list");
+            }
+        }
+    } else if (*page == TUI_PAGE_PORTS && item == 3) {
+        snprintf(current, sizeof(current), "%d", e->cfg.max_auto_ports);
+        if (prompt_text(e, *page, item, "Max scanned paths:", current, input, sizeof(input)) == 0) {
+            long v;
+            char *end = NULL;
+            v = strtol(input, &end, 10);
+            if (end && *end == '\0' && v >= 1 && v <= 65535) {
+                e->cfg.max_auto_ports = (int)v;
+                set_status(e, "Max paths updated");
+            } else {
+                set_status(e, "Invalid max paths");
+            }
+        }
+    } else if (*page == TUI_PAGE_DNS && item == 0) {
+        if (prompt_text(e, *page, item, "DNS tunnel domain:", e->cfg.dns_tunnel_domain, input, sizeof(input)) == 0 && input[0]) {
             copy_text(e->cfg.dns_tunnel_domain, sizeof(e->cfg.dns_tunnel_domain), input);
             normalize_domain(e->cfg.dns_tunnel_domain);
             set_status(e, "DNS tunnel domain set");
         }
-    } else if (selected == 5 && !e->running) {
-        if (prompt_text(e, selected, "DNS resolver/server IP:", e->cfg.dns_tunnel_resolver, input, sizeof(input)) == 0 && input[0]) {
+    } else if (*page == TUI_PAGE_DNS && item == 1) {
+        if (prompt_text(e, *page, item, "DNS resolver IP:", e->cfg.dns_tunnel_resolver, input, sizeof(input)) == 0) {
             copy_text(e->cfg.dns_tunnel_resolver, sizeof(e->cfg.dns_tunnel_resolver), input);
-            set_status(e, "DNS resolver set");
+            set_status(e, input[0] ? "DNS resolver set" : "DNS resolver will use Server IP");
         }
-    } else if (selected == 6 && !e->running) {
-        if (prompt_text(e, selected, "Server IP:", e->cfg.server_ip, input, sizeof(input)) == 0 && input[0]) {
+    } else if (*page == TUI_PAGE_CONNECTION && item == 0) {
+        e->cfg.mode = e->cfg.mode == MODE_CLIENT ? MODE_SERVER : MODE_CLIENT;
+        set_status(e, "Mode set to %s", mode_name(e->cfg.mode));
+    } else if (*page == TUI_PAGE_CONNECTION && item == 1) {
+        if (prompt_text(e, *page, item, "Server IP:", e->cfg.server_ip, input, sizeof(input)) == 0 && input[0]) {
             copy_text(e->cfg.server_ip, sizeof(e->cfg.server_ip), input);
             set_status(e, "Server IP set");
         }
-    } else if (selected == 7 && !e->running) {
-        ports_to_string(&e->cfg, current, sizeof(current));
-        if (prompt_text(e, selected, "Ports (auto, auto:1-65535, or list):", current, input, sizeof(input)) == 0) {
-            if (parse_port_setting(input, &e->cfg) == 0) {
-                set_status(e, "Ports updated");
-            } else {
-                set_status(e, "Invalid port setting");
-            }
-        }
-    } else if (selected == 8 && !e->running) {
-        if (prompt_text(e, selected, "Shared token:", e->cfg.token, input, sizeof(input)) == 0 && input[0]) {
+    } else if (*page == TUI_PAGE_CONNECTION && item == 2) {
+        if (prompt_text(e, *page, item, "Shared token:", e->cfg.token, input, sizeof(input)) == 0 && input[0]) {
             copy_text(e->cfg.token, sizeof(e->cfg.token), input);
             set_status(e, "Token updated");
         }
-    } else if (selected == 9 && !e->running) {
+    } else if (*page == TUI_PAGE_CONNECTION && item == 3) {
         snprintf(current, sizeof(current), "%.2f", e->cfg.rate_mbps);
-        if (prompt_text(e, selected, "Rate Mbps:", current, input, sizeof(input)) == 0) {
+        if (prompt_text(e, *page, item, "Rate Mbps:", current, input, sizeof(input)) == 0) {
             double v = strtod(input, NULL);
             if (v > 0.0 && v <= 10000.0) {
                 e->cfg.rate_mbps = v;
@@ -4019,21 +4315,37 @@ static void handle_menu_enter(engine_t *e, int selected) {
                 set_status(e, "Invalid rate");
             }
         }
-    } else if (selected == 10) {
-        if (e->running) {
-            engine_stop(e);
-        } else if (engine_start(e) != 0) {
-            e->running = 0;
+    } else if (*page == TUI_PAGE_TUNNEL && item == 0) {
+        e->cfg.vpn_enabled = !e->cfg.vpn_enabled;
+        set_status(e, "VPN mode %s", e->cfg.vpn_enabled ? "enabled" : "disabled");
+    } else if (*page == TUI_PAGE_TUNNEL && item == 1) {
+        e->cfg.route_all = !e->cfg.route_all;
+        set_status(e, "Route-all %s", e->cfg.route_all ? "enabled" : "disabled");
+    } else if (*page == TUI_PAGE_TUNNEL && item == 2) {
+        e->cfg.ipv6_enabled = !e->cfg.ipv6_enabled;
+        set_status(e, "IPv6 %s", e->cfg.ipv6_enabled ? "enabled" : "disabled");
+    } else if (*page == TUI_PAGE_TUNNEL && item == 3) {
+        if (prompt_text(e, *page, item, "Adapter name:", e->cfg.tun_name, input, sizeof(input)) == 0 && input[0]) {
+            copy_text(e->cfg.tun_name, sizeof(e->cfg.tun_name), input);
+            set_status(e, "Adapter name set");
         }
-    } else if (selected == 11) {
-        g_stop = 1;
-    } else if (e->running) {
-        set_status(e, "Stop before editing settings");
+    } else if (*page == TUI_PAGE_TUNNEL && item == 4) {
+        if (prompt_text(e, *page, item, "Tunnel DNS server:", e->cfg.dns_server, input, sizeof(input)) == 0) {
+            if (input[0]) {
+                copy_text(e->cfg.dns_server, sizeof(e->cfg.dns_server), input);
+                e->cfg.dns_enabled = 1;
+                set_status(e, "Tunnel DNS set");
+            } else {
+                e->cfg.dns_enabled = 0;
+                set_status(e, "Tunnel DNS disabled");
+            }
+        }
     }
 }
 
 static int run_tui(config_t cfg) {
     engine_t *e;
+    tui_page_t page = TUI_PAGE_MAIN;
     int selected = 0;
     uint64_t last_tick;
     e = (engine_t *)calloc(1, sizeof(*e));
@@ -4063,17 +4375,25 @@ static int run_tui(config_t cfg) {
 
         ev = read_key();
         if (ev.type == KEY_UP) {
-            selected = (selected + ST_MAX_MENU - 1) % ST_MAX_MENU;
+            int count = tui_item_count(page);
+            selected = (selected + count - 1) % count;
         } else if (ev.type == KEY_DOWN) {
-            selected = (selected + 1) % ST_MAX_MENU;
+            int count = tui_item_count(page);
+            selected = (selected + 1) % count;
         } else if (ev.type == KEY_ENTER) {
-            handle_menu_enter(e, selected);
+            handle_menu_enter(e, &page, &selected);
+        } else if (ev.type == KEY_LEFT || ev.type == KEY_ESC ||
+                   (ev.type == KEY_BACKSPACE && page != TUI_PAGE_MAIN)) {
+            if (page != TUI_PAGE_MAIN) {
+                page = tui_parent_page(page);
+                selected = 0;
+            }
         } else if (ev.type == KEY_CHAR && (ev.ch == 'q' || ev.ch == 'Q')) {
             g_stop = 1;
         }
 
         if (now - e->last_draw_ms > 100) {
-            draw_tui(e, selected, NULL, NULL);
+            draw_tui(e, page, selected, NULL, NULL);
             e->last_draw_ms = now;
         }
         sleep_ms(10);
@@ -4139,7 +4459,7 @@ static int run_headless(config_t cfg) {
 
 static void usage(const char *argv0) {
     printf("usage: %s [--client|--server] [--server-ip IP] [--ports auto|auto:A-B|LIST]\n", argv0);
-    printf("          [--transport udp|tcp|dns|both|all|udp+dns|tcp+dns]\n");
+    printf("          [--transport udp|tcp|dns|udp+tcp|udp+dns|tcp+dns|all]\n");
     printf("          [--auto-range A-B] [--max-auto-ports N]\n");
     printf("          [--vpn|--no-vpn] [--no-route] [--tun-name NAME] [--tun-mtu N]\n");
     printf("          [--tun-server-ip IP] [--tun-client-ip IP] [--tun-cidr CIDR]\n");
