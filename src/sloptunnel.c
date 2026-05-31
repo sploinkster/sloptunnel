@@ -179,6 +179,7 @@ typedef struct {
     char dns_server[32];
     char dns_tunnel_domain[192];
     char dns_tunnel_resolver[64];
+    char egress_interface[128];
     uint16_t ports[ST_MAX_CONFIG_PORTS];
     int port_count;
     int auto_ports;
@@ -969,12 +970,28 @@ static int systemf(const char *fmt, ...) {
 #ifdef _WIN32
 static void trim_command_output(char *s) {
     size_t n;
+    size_t i;
     if (!s) {
         return;
     }
     n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' ||
                      s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = '\0';
+    }
+    for (i = 0; s[i]; i++) {
+        if (s[i] == '\r' || s[i] == '\n' || s[i] == '\t') {
+            s[i] = ' ';
+        }
+    }
+    {
+        char *detail = strstr(s, " At line:");
+        if (detail) {
+            *detail = '\0';
+        }
+    }
+    n = strlen(s);
+    while (n > 0 && s[n - 1] == ' ') {
         s[--n] = '\0';
     }
 }
@@ -986,7 +1003,7 @@ static int command_status_code(int rc) {
 
 #ifdef _WIN32
 static int windows_command_capture(const char *cmd, char *out, size_t out_len) {
-    char wrapped[2300];
+    char wrapped[6200];
     FILE *p;
     size_t used = 0;
     int rc;
@@ -1021,8 +1038,8 @@ static int windows_command_capture(const char *cmd, char *out, size_t out_len) {
 
 static int windows_commandf(engine_t *e, const char *label, int fatal,
                             const char *fmt, ...) {
-    char cmd[2200];
-    char output[512];
+    char cmd[6000];
+    char output[900];
     va_list ap;
     int n;
     int rc;
@@ -1047,21 +1064,42 @@ static int windows_commandf(engine_t *e, const char *label, int fatal,
 
 static int windows_add_host_route(engine_t *e, const char *label,
                                   const char *target_ip, int fatal) {
+    const char *preferred = e->cfg.egress_interface;
     return windows_commandf(e, label, fatal,
                             "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-                            "\"$ErrorActionPreference='Stop'; "
-                            "$prefix='%s/32'; "
-                            "$r=Find-NetRoute -RemoteIPAddress '%s' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1; "
-                            "if(!$r){throw 'No existing route to host before enabling tunnel'}; "
-                            "$idx=$r.InterfaceIndex; $nh=[string]$r.NextHop; "
+                            "\"$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
+                            "$prefix='%s/32'; $target='%s'; $tun='%s'; $preferred='%s'; "
+                            "$routes=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop; "
+                            "$best=$null; $score=2147483647; "
+                            "foreach($r in $routes){"
+                            "if($r.InterfaceAlias -eq $tun){continue}; "
+                            "if(!$r.NextHop -or [string]$r.NextHop -eq '0.0.0.0'){continue}; "
+                            "if($preferred -and $r.InterfaceAlias -ne $preferred){continue}; "
+                            "$idx=$r.InterfaceIndex; "
+                            "$ips=Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $idx -ErrorAction SilentlyContinue; "
+                            "if($ips | Where-Object {$_.IPAddress -eq '192.168.137.1'}){continue}; "
+                            "$ipif=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $idx -ErrorAction SilentlyContinue | Select-Object -First 1; "
+                            "$prof=Get-NetConnectionProfile -InterfaceIndex $idx -ErrorAction SilentlyContinue | Select-Object -First 1; "
+                            "$im=0; if($ipif){$im=[int]$ipif.InterfaceMetric}; "
+                            "$m=[int]$r.RouteMetric + $im; "
+                            "if($prof -and [string]$prof.IPv4Connectivity -eq 'Internet'){$m-=100000}; "
+                            "if([string]$r.InterfaceAlias -match 'Wi-Fi|Wireless|WLAN'){$m-=1000}; "
+                            "if($m -lt $score){$best=$r; $score=$m}"
+                            "}; "
+                            "if(!$best -and !$preferred){"
+                            "$best=Find-NetRoute -RemoteIPAddress $target -ErrorAction Stop | "
+                            "Where-Object {$_.InterfaceAlias -ne $tun} | Sort-Object RouteMetric | Select-Object -First 1"
+                            "}; "
+                            "if(!$best){throw 'No usable upstream route to host before enabling tunnel'}; "
+                            "$idx=$best.InterfaceIndex; $nh=[string]$best.NextHop; "
                             "Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
-                            "if($nh -and $nh -ne '0.0.0.0'){"
+                            "if($nh -and $nh -ne '0.0.0.0' -and $nh -ne $target){"
                             "New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $idx -NextHop $nh -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
                             "}else{"
                             "New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $idx -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
                             "}; "
                             "if(!(Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue)){throw 'Host bypass route was not installed'}\"",
-                            target_ip, target_ip);
+                            target_ip, target_ip, e->cfg.tun_name, preferred);
 }
 #endif
 
@@ -2342,6 +2380,20 @@ static int safe_optional_text(const char *s) {
     return !s || !*s || safe_token_text(s);
 }
 
+static int safe_optional_interface_text(const char *s) {
+    size_t i;
+    if (!s || !*s) {
+        return 1;
+    }
+    for (i = 0; s[i]; i++) {
+        if (!(isalnum((unsigned char)s[i]) || s[i] == ' ' || s[i] == '.' ||
+              s[i] == '_' || s[i] == '-' || s[i] == ':' || s[i] == '/')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 #ifdef _WIN32
 static int widen_text(const char *src, wchar_t *dst, size_t dst_count) {
     int n = MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, (int)dst_count);
@@ -2398,6 +2450,7 @@ static int vpn_start(engine_t *e) {
         !safe_token_text(e->cfg.tun_cidr) || !safe_token_text(e->cfg.dns_server) ||
         !safe_token_text(e->cfg.dns_tunnel_domain) ||
         !safe_optional_text(e->cfg.dns_tunnel_resolver) ||
+        !safe_optional_interface_text(e->cfg.egress_interface) ||
         !safe_token_text(e->cfg.tun_server_ip6) || !safe_token_text(e->cfg.tun_client_ip6) ||
         !safe_token_text(e->cfg.tun_cidr6)) {
         set_status(e, "Unsafe tunnel, server, or DNS setting");
@@ -4353,6 +4406,7 @@ typedef enum {
 typedef enum {
     TUI_TUNNEL_MODE = 0,
     TUI_TUNNEL_ROUTE_ALL,
+    TUI_TUNNEL_EGRESS,
     TUI_TUNNEL_IPV6,
     TUI_TUNNEL_ADAPTER,
     TUI_TUNNEL_DNS,
@@ -4454,6 +4508,12 @@ static tui_tunnel_item_t tui_tunnel_item_for_row(const config_t *cfg, int row) {
                 return TUI_TUNNEL_ROUTE_ALL;
             }
             row--;
+            if (cfg->route_all) {
+                if (row == 0) {
+                    return TUI_TUNNEL_EGRESS;
+                }
+                row--;
+            }
         }
         if (row == 0) {
             return TUI_TUNNEL_IPV6;
@@ -4494,7 +4554,7 @@ static int tui_item_count(const engine_t *e, tui_page_t page) {
         if (!e->cfg.vpn_enabled) {
             return 2;
         }
-        return 4 + (e->cfg.mode == MODE_CLIENT ? 2 : 0);
+        return 4 + (e->cfg.mode == MODE_CLIENT ? 2 + (e->cfg.route_all ? 1 : 0) : 0);
     }
     return 1;
 }
@@ -4660,6 +4720,10 @@ static void tui_item_text(const engine_t *e, tui_page_t page, int selected,
             copy_text(label, label_len, "Route all");
             copy_text(value, value_len, e->cfg.route_all ? "enabled" : "disabled");
             copy_text(desc, desc_len, "When enabled, client default routes are split through the tunnel while preserving a direct route to the server.");
+        } else if (item == TUI_TUNNEL_EGRESS) {
+            copy_text(label, label_len, "Egress");
+            copy_text(value, value_len, e->cfg.egress_interface[0] ? e->cfg.egress_interface : "auto");
+            copy_text(desc, desc_len, "Optional upstream interface for server and DNS bypass routes. Use Wi-Fi when Ethernet is the ICS/AP side.");
         } else if (item == TUI_TUNNEL_IPV6) {
             copy_text(label, label_len, "IPv6");
             copy_text(value, value_len, e->cfg.ipv6_enabled ? "enabled" : "disabled");
@@ -5005,7 +5069,20 @@ static void handle_menu_enter(engine_t *e, tui_page_t *page, int *selected) {
     } else if (*page == TUI_PAGE_TUNNEL &&
                tui_tunnel_item_for_row(&e->cfg, item) == TUI_TUNNEL_ROUTE_ALL) {
         e->cfg.route_all = !e->cfg.route_all;
+        if (*selected >= tui_item_count(e, *page)) {
+            *selected = tui_item_count(e, *page) - 1;
+        }
         set_status(e, "Route-all %s", e->cfg.route_all ? "enabled" : "disabled");
+    } else if (*page == TUI_PAGE_TUNNEL &&
+               tui_tunnel_item_for_row(&e->cfg, item) == TUI_TUNNEL_EGRESS) {
+        if (prompt_text(e, *page, item, "Egress interface:", e->cfg.egress_interface, input, sizeof(input)) == 0) {
+            if (safe_optional_interface_text(input)) {
+                copy_text(e->cfg.egress_interface, sizeof(e->cfg.egress_interface), input);
+                set_status(e, input[0] ? "Egress interface set" : "Egress interface auto");
+            } else {
+                set_status(e, "Invalid egress interface");
+            }
+        }
     } else if (*page == TUI_PAGE_TUNNEL &&
                tui_tunnel_item_for_row(&e->cfg, item) == TUI_TUNNEL_IPV6) {
         e->cfg.ipv6_enabled = !e->cfg.ipv6_enabled;
@@ -5142,6 +5219,11 @@ static int run_headless(config_t cfg) {
         }
         last_tick = now;
         engine_tick(e, now, dt);
+        if (!e->running) {
+            fprintf(stderr, "error: %s\n", e->status[0] ? e->status : "engine stopped");
+            free(e);
+            return 1;
+        }
         if (now - last_print >= 1000) {
             fmt_rate(e->tx_bps, tx, sizeof(tx));
             fmt_rate(e->rx_bps, rx, sizeof(rx));
@@ -5165,7 +5247,7 @@ static void usage(const char *argv0) {
     printf("usage: %s [--client|--server] [--server-ip IP] [--ports auto|auto:A-B|LIST]\n", argv0);
     printf("          [--transport udp|tcp|dns|udp+tcp|udp+dns|tcp+dns|all]\n");
     printf("          [--auto-range A-B] [--max-auto-ports N]\n");
-    printf("          [--vpn|--no-vpn] [--no-route] [--tun-name NAME] [--tun-mtu N]\n");
+    printf("          [--vpn|--no-vpn] [--no-route] [--egress-interface NAME] [--tun-name NAME] [--tun-mtu N]\n");
     printf("          [--tun-server-ip IP] [--tun-client-ip IP] [--tun-cidr CIDR]\n");
     printf("          [--ipv6|--no-ipv6] [--tun-server-ip6 IP] [--tun-client-ip6 IP] [--tun-cidr6 CIDR]\n");
     printf("          [--dns-server IP|--no-dns] [--dns-tunnel-domain DOMAIN] [--dns-resolver IP]\n");
@@ -5192,6 +5274,9 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
             cfg->vpn_enabled = 0;
         } else if (strcmp(argv[i], "--no-route") == 0) {
             cfg->route_all = 0;
+        } else if ((strcmp(argv[i], "--egress-interface") == 0 ||
+                    strcmp(argv[i], "--upstream-interface") == 0) && i + 1 < argc) {
+            copy_text(cfg->egress_interface, sizeof(cfg->egress_interface), argv[++i]);
         } else if (strcmp(argv[i], "--ipv6") == 0) {
             cfg->ipv6_enabled = 1;
         } else if (strcmp(argv[i], "--no-ipv6") == 0) {

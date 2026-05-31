@@ -81,6 +81,15 @@ other IPv4 traffic are routed through the TUN interface once the client is runni
 Use `--no-vpn` for transport benchmarking only, or `--no-route` to create the TUN
 interface without capturing the default route.
 
+On Windows hosts that also share Internet Connection Sharing to an Ethernet/AP
+side, leave the tunnel egress setting on `auto` first. If paths authenticate and
+then drop as soon as the shared Ethernet/AP side is connected, force the upstream
+adapter so the server and DNS bypass routes stay on Wi-Fi:
+
+```sh
+sloptunnel.exe --client --server-ip 18.219.84.252 --egress-interface Wi-Fi --token-file sloptunnel-token.txt
+```
+
 DNS tunneling can be used alone or stacked with port masquerading:
 
 ```sh
