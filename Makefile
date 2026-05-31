@@ -4,7 +4,7 @@ LDLIBS :=
 
 ifeq ($(OS),Windows_NT)
 TARGET := build/sloptunnel.exe
-LDLIBS += -lws2_32
+LDLIBS += -lws2_32 -ladvapi32
 else
 TARGET := build/sloptunnel
 endif

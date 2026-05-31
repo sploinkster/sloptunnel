@@ -18,6 +18,7 @@
 #include <io.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 typedef SOCKET socket_t;
 #define ST_INVALID_SOCKET INVALID_SOCKET
@@ -322,6 +323,8 @@ typedef struct {
     char status[256];
 } engine_t;
 
+static void set_status(engine_t *e, const char *fmt, ...);
+
 static volatile sig_atomic_t g_stop = 0;
 
 #ifndef _WIN32
@@ -543,6 +546,28 @@ static void network_cleanup(void) {
 #endif
 }
 
+#ifdef _WIN32
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
+static void disable_udp_connreset(socket_t fd) {
+    BOOL disabled = FALSE;
+    DWORD bytes = 0;
+    (void)WSAIoctl(fd, SIO_UDP_CONNRESET, &disabled, sizeof(disabled),
+                   NULL, 0, &bytes, NULL, NULL);
+}
+#endif
+
+static int udp_recv_transient_error(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAEWOULDBLOCK || e == WSAECONNRESET;
+#else
+    return socket_would_block();
+#endif
+}
+
 static uint64_t random_session_id(void) {
     uint64_t t = (uint64_t)time(NULL) ^ (now_ms() << 21);
 #ifdef _WIN32
@@ -731,6 +756,76 @@ static const char *transport_name(transport_t transport) {
         return "udp+tcp";
     }
     return "udp";
+}
+
+static int process_is_elevated(void) {
+#ifdef _WIN32
+    BOOL is_admin = FALSE;
+    PSID admin_group = NULL;
+    SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&nt_authority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0,
+                                 &admin_group)) {
+        if (!CheckTokenMembership(NULL, admin_group, &is_admin)) {
+            is_admin = FALSE;
+        }
+        FreeSid(admin_group);
+    }
+    return is_admin ? 1 : 0;
+#else
+    return geteuid() == 0;
+#endif
+}
+
+#ifndef _WIN32
+static int fixed_ports_include_privileged(const config_t *cfg) {
+    int i;
+    if (cfg->auto_ports) {
+        return cfg->range_start < 1024;
+    }
+    for (i = 0; i < cfg->port_count; i++) {
+        if (cfg->ports[i] < 1024) {
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
+static int config_requires_elevation(const config_t *cfg, char *reason, size_t reason_len) {
+    if (reason_len > 0) {
+        reason[0] = '\0';
+    }
+    if (cfg->vpn_enabled) {
+        snprintf(reason, reason_len,
+                 "Full-tunnel VPN needs Administrator/root privileges for Wintun/TUN and routes");
+        return 1;
+    }
+#ifndef _WIN32
+    if (cfg->mode == MODE_SERVER && transport_has_dns(cfg->transport)) {
+        snprintf(reason, reason_len,
+                 "DNS tunneling listens on UDP 53; run as root or grant CAP_NET_BIND_SERVICE");
+        return 1;
+    }
+    if (cfg->mode == MODE_SERVER &&
+        (transport_has_udp(cfg->transport) || transport_has_tcp(cfg->transport)) &&
+        fixed_ports_include_privileged(cfg)) {
+        snprintf(reason, reason_len,
+                 "Listening below port 1024 needs root or CAP_NET_BIND_SERVICE");
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static int preflight_privileges(engine_t *e) {
+    char reason[220];
+    if (config_requires_elevation(&e->cfg, reason, sizeof(reason)) &&
+        !process_is_elevated()) {
+        set_status(e, "%s", reason);
+        return -1;
+    }
+    return 0;
 }
 
 static const char *proto_name(path_proto_t proto) {
@@ -1567,6 +1662,9 @@ static int make_udp_socket(uint16_t port, int bind_any, const char *remote_ip,
         return -1;
     }
 
+#ifdef _WIN32
+    disable_udp_connreset(s);
+#endif
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
     if (set_nonblocking(s) != 0) {
         close_socket(s);
@@ -1666,6 +1764,9 @@ static int make_unbound_udp_socket(socket_t *fd) {
     if (!socket_valid(s)) {
         return -1;
     }
+#ifdef _WIN32
+    disable_udp_connreset(s);
+#endif
     if (set_nonblocking(s) != 0) {
         close_socket(s);
         return -1;
@@ -2631,6 +2732,10 @@ static int engine_start(engine_t *e) {
     e->rx_bps = 0.0;
     derive_key(e->cfg.token, &e->key0, &e->key1);
 
+    if (preflight_privileges(e) != 0) {
+        return -1;
+    }
+
     capacity = e->cfg.auto_ports ? auto_capacity(&e->cfg) : e->cfg.port_count;
     capacity *= transport_count(e->cfg.transport);
     if (capacity <= 0) {
@@ -2963,7 +3068,7 @@ static void receive_server(engine_t *e, path_t *p, int index, uint64_t now) {
         got = (int)recvfrom(p->fd, (char *)buf, sizeof(buf), 0,
                             (struct sockaddr *)&from, &from_len);
         if (got < 0) {
-            if (!socket_would_block()) {
+            if (!udp_recv_transient_error()) {
                 set_status(e, "Server recv error on port %u", (unsigned)p->port);
             }
             break;
@@ -3177,7 +3282,7 @@ static void receive_client(engine_t *e, path_t *p, uint64_t now) {
         got = (int)recvfrom(p->fd, (char *)buf, sizeof(buf), 0,
                             (struct sockaddr *)&from, &from_len);
         if (got < 0) {
-            if (!socket_would_block()) {
+            if (!udp_recv_transient_error()) {
                 set_status(e, "Client recv error on port %u", (unsigned)p->port);
             }
             break;
@@ -3323,7 +3428,7 @@ static void receive_client_shared(engine_t *e, uint64_t now) {
         got = (int)recvfrom(e->shared_client_fd, (char *)buf, sizeof(buf), 0,
                             (struct sockaddr *)&from, &from_len);
         if (got < 0) {
-            if (!socket_would_block()) {
+            if (!udp_recv_transient_error()) {
                 set_status(e, "Client recv error on shared socket");
             }
             break;
@@ -3437,7 +3542,7 @@ static void receive_client_dns(engine_t *e, path_t *p, uint64_t now) {
         int got = (int)recvfrom(p->fd, (char *)buf, sizeof(buf), 0,
                                 (struct sockaddr *)&from, &from_len);
         if (got < 0) {
-            if (!socket_would_block()) {
+            if (!udp_recv_transient_error()) {
                 set_status(e, "DNS recv error");
             }
             break;
@@ -3478,7 +3583,7 @@ static void receive_server_dns(engine_t *e, path_t *p, int index, uint64_t now) 
         got = (int)recvfrom(p->fd, (char *)buf, sizeof(buf), 0,
                             (struct sockaddr *)&from, &from_len);
         if (got < 0) {
-            if (!socket_would_block()) {
+            if (!udp_recv_transient_error()) {
                 set_status(e, "DNS server recv error");
             }
             break;
@@ -4479,7 +4584,7 @@ static int prompt_text(engine_t *e, tui_page_t page, int selected, const char *l
                        const char *initial, char *out, size_t out_len) {
     char buf[256];
     size_t len = 0;
-    uint64_t last = 0;
+    int dirty = 1;
     if (initial) {
         snprintf(buf, sizeof(buf), "%s", initial);
         len = strlen(buf);
@@ -4489,10 +4594,9 @@ static int prompt_text(engine_t *e, tui_page_t page, int selected, const char *l
 
     for (;;) {
         key_event_t ev;
-        uint64_t now = now_ms();
-        if (now - last > 33) {
+        if (dirty) {
             draw_tui(e, page, selected, label, buf);
-            last = now;
+            dirty = 0;
         }
         ev = read_key();
         if (ev.type == KEY_NONE) {
@@ -4511,11 +4615,13 @@ static int prompt_text(engine_t *e, tui_page_t page, int selected, const char *l
         if (ev.type == KEY_BACKSPACE) {
             if (len > 0) {
                 buf[--len] = '\0';
+                dirty = 1;
             }
         } else if (ev.type == KEY_CHAR && isprint((unsigned char)ev.ch)) {
             if (len + 1 < sizeof(buf)) {
                 buf[len++] = (char)ev.ch;
                 buf[len] = '\0';
+                dirty = 1;
             }
         }
     }
@@ -4739,6 +4845,8 @@ static int run_tui(config_t cfg) {
     engine_t *e;
     tui_page_t page = TUI_PAGE_MAIN;
     int selected = 0;
+    int dirty = 1;
+    char current[220];
     uint64_t last_tick;
     e = (engine_t *)calloc(1, sizeof(*e));
     if (!e) {
@@ -4747,6 +4855,10 @@ static int run_tui(config_t cfg) {
     }
     e->cfg = cfg;
     set_status(e, "Ready");
+    if (config_requires_elevation(&e->cfg, current, sizeof(current)) &&
+        !process_is_elevated()) {
+        set_status(e, "%s", current);
+    }
 
     if (term_init() != 0) {
         fprintf(stderr, "error: failed to initialize terminal\n");
@@ -4770,27 +4882,32 @@ static int run_tui(config_t cfg) {
         if (ev.type == KEY_UP) {
             int count = tui_item_count(e, page);
             selected = (selected + count - 1) % count;
+            dirty = 1;
         } else if (ev.type == KEY_DOWN) {
             int count = tui_item_count(e, page);
             selected = (selected + 1) % count;
+            dirty = 1;
         } else if (ev.type == KEY_ENTER) {
             if (now - e->last_enter_ms > 250) {
                 e->last_enter_ms = now;
                 handle_menu_enter(e, &page, &selected);
+                dirty = 1;
             }
         } else if (ev.type == KEY_LEFT || ev.type == KEY_ESC ||
                    (ev.type == KEY_BACKSPACE && page != TUI_PAGE_MAIN)) {
             if (page != TUI_PAGE_MAIN) {
                 page = tui_parent_page(page);
                 selected = 0;
+                dirty = 1;
             }
         } else if (ev.type == KEY_CHAR && (ev.ch == 'q' || ev.ch == 'Q')) {
             g_stop = 1;
         }
 
-        if (now - e->last_draw_ms > 100) {
+        if (dirty || now - e->last_draw_ms > (e->running ? 1000U : 500U)) {
             draw_tui(e, page, selected, NULL, NULL);
             e->last_draw_ms = now;
+            dirty = 0;
         }
         sleep_ms(10);
     }
