@@ -306,6 +306,7 @@ typedef struct {
     uint64_t last_hello_ms;
     uint64_t last_draw_ms;
     uint64_t last_diagnostic_ms;
+    uint64_t last_enter_ms;
     uint64_t total_tx;
     uint64_t total_rx;
     double tx_bps;
@@ -313,6 +314,7 @@ typedef struct {
     double send_credit;
     int next_path;
     int running;
+    int vpn_pending;
     int active_peers;
     vpn_state_t vpn;
     peer_t peers[32];
@@ -2579,6 +2581,7 @@ static int vpn_write_packet(engine_t *e, const uint8_t *buf, size_t len) {
 }
 
 static void engine_stop(engine_t *e);
+static void engine_stop_preserve_status(engine_t *e);
 
 static int engine_start(engine_t *e) {
     int i;
@@ -2619,6 +2622,7 @@ static int engine_start(engine_t *e) {
     e->last_rate_ms = e->started_ms;
     e->last_hello_ms = 0;
     e->last_diagnostic_ms = 0;
+    e->vpn_pending = 0;
     e->send_credit = 0.0;
     e->next_path = 0;
     e->total_tx = 0;
@@ -2647,14 +2651,14 @@ static int engine_start(engine_t *e) {
                                e->cfg.dns_tunnel_resolver : e->cfg.server_ip;
         if (!p) {
             set_status(e, "No capacity for DNS tunnel path");
-            engine_stop(e);
+            engine_stop_preserve_status(e);
             return -1;
         }
         if (e->cfg.mode == MODE_SERVER) {
             if (make_udp_socket(ST_DNS_PORT, 1, NULL, &p->fd, NULL) != 0) {
                 e->path_count--;
                 set_status(e, "Could not bind DNS UDP port 53");
-                engine_stop(e);
+                engine_stop_preserve_status(e);
                 return -1;
             }
         } else {
@@ -2662,7 +2666,7 @@ static int engine_start(engine_t *e) {
                 fill_remote_addr(resolver, ST_DNS_PORT, &p->remote) != 0) {
                 e->path_count--;
                 set_status(e, "Could not create DNS tunnel socket");
-                engine_stop(e);
+                engine_stop_preserve_status(e);
                 return -1;
             }
         }
@@ -2704,14 +2708,14 @@ static int engine_start(engine_t *e) {
             set_status(e, "No %s ports could be bound in %u-%u",
                        transport_name(e->cfg.transport),
                        (unsigned)e->cfg.range_start, (unsigned)e->cfg.range_end);
-            engine_stop(e);
+            engine_stop_preserve_status(e);
             return -1;
         }
     } else if (e->cfg.auto_ports && e->cfg.mode == MODE_CLIENT) {
         if (transport_has_udp(e->cfg.transport) &&
             make_unbound_udp_socket(&e->shared_client_fd) != 0) {
             set_status(e, "Could not create UDP probe socket");
-            engine_stop(e);
+            engine_stop_preserve_status(e);
             return -1;
         }
     } else {
@@ -2724,7 +2728,7 @@ static int engine_start(engine_t *e) {
                             e->path_count--;
                         }
                         set_status(e, "Could not bind TCP port %u", (unsigned)e->cfg.ports[i]);
-                        engine_stop(e);
+                        engine_stop_preserve_status(e);
                         return -1;
                     }
                 }
@@ -2738,7 +2742,7 @@ static int engine_start(engine_t *e) {
                             e->path_count--;
                         }
                         set_status(e, "Could not bind UDP port %u", (unsigned)e->cfg.ports[i]);
-                        engine_stop(e);
+                        engine_stop_preserve_status(e);
                         return -1;
                     }
                 }
@@ -2751,7 +2755,7 @@ static int engine_start(engine_t *e) {
                         }
                         set_status(e, "Invalid server IP or UDP socket failure for %s:%u",
                                    e->cfg.server_ip, (unsigned)e->cfg.ports[i]);
-                        engine_stop(e);
+                        engine_stop_preserve_status(e);
                         return -1;
                     }
                 }
@@ -2762,7 +2766,7 @@ static int engine_start(engine_t *e) {
         }
         if (e->cfg.mode == MODE_SERVER && e->path_count == 0) {
             set_status(e, "No paths available");
-            engine_stop(e);
+            engine_stop_preserve_status(e);
             return -1;
         }
     }
@@ -2772,7 +2776,7 @@ static int engine_start(engine_t *e) {
         struct sockaddr_in probe;
         if (fill_remote_addr(e->cfg.server_ip, e->cfg.range_start, &probe) != 0) {
             set_status(e, "Invalid server IP: %s", e->cfg.server_ip);
-            engine_stop(e);
+            engine_stop_preserve_status(e);
             return -1;
         }
     } else if (e->cfg.mode == MODE_CLIENT) {
@@ -2783,18 +2787,23 @@ static int engine_start(engine_t *e) {
             if (fill_remote_addr(e->cfg.server_ip, e->paths[i].port, &e->paths[i].remote) != 0) {
                 set_status(e, "Invalid server IP or socket failure for %s:%u",
                            e->cfg.server_ip, (unsigned)e->paths[i].port);
-                engine_stop(e);
+                engine_stop_preserve_status(e);
                 return -1;
             }
         }
     }
 
-    headless_phase(e, "vpn_starting");
-    if (vpn_start(e) != 0) {
-        engine_stop(e);
-        return -1;
+    if (e->cfg.mode == MODE_CLIENT && e->cfg.vpn_enabled) {
+        e->vpn_pending = 1;
+        headless_phase(e, "vpn_deferred_until_auth");
+    } else {
+        headless_phase(e, "vpn_starting");
+        if (vpn_start(e) != 0) {
+            engine_stop_preserve_status(e);
+            return -1;
+        }
+        headless_phase(e, "vpn_ready");
     }
-    headless_phase(e, "vpn_ready");
 
     e->running = 1;
     if (e->cfg.auto_ports && e->cfg.mode == MODE_CLIENT) {
@@ -2802,11 +2811,19 @@ static int engine_start(engine_t *e) {
                    transport_name(e->cfg.transport),
                    (unsigned)e->cfg.range_start, (unsigned)e->cfg.range_end,
                    e->path_capacity);
+        if (e->vpn_pending) {
+            set_status(e, "Client probing %s ports %u-%u; VPN waits for an authenticated path",
+                       transport_name(e->cfg.transport),
+                       (unsigned)e->cfg.range_start, (unsigned)e->cfg.range_end);
+        }
     } else {
         set_status(e, "%s started with %d %s path%s",
                    e->cfg.mode == MODE_SERVER ? "Server" : "Client",
                    e->path_count, transport_name(e->cfg.transport),
                    e->path_count == 1 ? "" : "s");
+        if (e->vpn_pending) {
+            set_status(e, "Client started; VPN waits for an authenticated tunnel path");
+        }
     }
     return 0;
 }
@@ -2837,7 +2854,17 @@ static void engine_stop(engine_t *e) {
     e->path_count = 0;
     e->path_capacity = 0;
     e->running = 0;
+    e->vpn_pending = 0;
     set_status(e, "Stopped");
+}
+
+static void engine_stop_preserve_status(engine_t *e) {
+    char status[sizeof(e->status)];
+    copy_text(status, sizeof(status), e->status);
+    engine_stop(e);
+    if (status[0]) {
+        copy_text(e->status, sizeof(e->status), status);
+    }
 }
 
 static void update_rates(engine_t *e, uint64_t now) {
@@ -3744,6 +3771,23 @@ static void client_send_data(engine_t *e, uint64_t now, uint64_t dt_ms) {
     }
 }
 
+static int maybe_start_client_vpn(engine_t *e) {
+    if (!e->vpn_pending || e->vpn.active || e->cfg.mode != MODE_CLIENT) {
+        return 0;
+    }
+    if (authenticated_path_count(e) <= 0) {
+        return 0;
+    }
+    set_status(e, "Authenticated path ready; enabling full-tunnel VPN");
+    if (vpn_start(e) != 0) {
+        engine_stop_preserve_status(e);
+        return -1;
+    }
+    e->vpn_pending = 0;
+    set_status(e, "VPN enabled over authenticated tunnel path");
+    return 1;
+}
+
 static void engine_tick(engine_t *e, uint64_t now, uint64_t dt_ms) {
     int i;
     if (!e->running) {
@@ -3814,6 +3858,9 @@ static void engine_tick(engine_t *e, uint64_t now, uint64_t dt_ms) {
             if (transport_has_dns(e->cfg.transport)) {
                 client_poll_dns(e, now);
             }
+        }
+        if (maybe_start_client_vpn(e) < 0) {
+            return;
         }
         if (e->vpn.active) {
             vpn_pump_tun(e, now);
@@ -4727,7 +4774,10 @@ static int run_tui(config_t cfg) {
             int count = tui_item_count(e, page);
             selected = (selected + 1) % count;
         } else if (ev.type == KEY_ENTER) {
-            handle_menu_enter(e, &page, &selected);
+            if (now - e->last_enter_ms > 250) {
+                e->last_enter_ms = now;
+                handle_menu_enter(e, &page, &selected);
+            }
         } else if (ev.type == KEY_LEFT || ev.type == KEY_ESC ||
                    (ev.type == KEY_BACKSPACE && page != TUI_PAGE_MAIN)) {
             if (page != TUI_PAGE_MAIN) {
