@@ -7,4 +7,6 @@ keys/
 *.pid
 runtime/
 lab/windows/
+lab/windows-ics/
 lab/win11/
+lab/wsl/

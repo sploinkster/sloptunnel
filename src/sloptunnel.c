@@ -204,6 +204,7 @@ typedef struct {
     double tx_bps;
     double rx_bps;
     uint64_t last_ack_ms;
+    uint64_t next_probe_ms;
     double rtt_ms;
     int healthy;
     int shared_fd;
@@ -1043,6 +1044,25 @@ static int windows_commandf(engine_t *e, const char *label, int fatal,
     }
     return fatal ? -1 : 0;
 }
+
+static int windows_add_host_route(engine_t *e, const char *label,
+                                  const char *target_ip, int fatal) {
+    return windows_commandf(e, label, fatal,
+                            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                            "\"$ErrorActionPreference='Stop'; "
+                            "$prefix='%s/32'; "
+                            "$r=Find-NetRoute -RemoteIPAddress '%s' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1; "
+                            "if(!$r){throw 'No existing route to host before enabling tunnel'}; "
+                            "$idx=$r.InterfaceIndex; $nh=[string]$r.NextHop; "
+                            "Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
+                            "if($nh -and $nh -ne '0.0.0.0'){"
+                            "New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $idx -NextHop $nh -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
+                            "}else{"
+                            "New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $idx -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
+                            "}; "
+                            "if(!(Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue)){throw 'Host bypass route was not installed'}\"",
+                            target_ip, target_ip);
+}
 #endif
 
 #ifndef _WIN32
@@ -1782,6 +1802,11 @@ static int fill_remote_addr(const char *remote_ip, uint16_t port, struct sockadd
     return inet_pton(AF_INET, remote_ip, &remote->sin_addr) == 1 ? 0 : -1;
 }
 
+static int is_ipv4_literal(const char *ip) {
+    struct in_addr addr;
+    return ip && *ip && inet_pton(AF_INET, ip, &addr) == 1;
+}
+
 static int range_size(const config_t *cfg) {
     return (int)((unsigned)cfg->range_end - (unsigned)cfg->range_start + 1U);
 }
@@ -1830,6 +1855,17 @@ static path_t *add_path(engine_t *e, path_proto_t proto, uint16_t port) {
     p->fd = ST_INVALID_SOCKET;
     p->healthy = 1;
     return p;
+}
+
+static int path_has_socket(const path_t *p) {
+    return p && socket_valid(p->fd);
+}
+
+static int path_can_send(const path_t *p) {
+    if (!path_has_socket(p)) {
+        return 0;
+    }
+    return p->healthy || p->last_ack_ms == 0;
 }
 
 static void remember_sent(engine_t *e, uint64_t seq, uint64_t t_ms) {
@@ -2035,14 +2071,20 @@ static int dns_reassemble_fragment(engine_t *e, const uint8_t *payload,
 
 static int send_all_now(socket_t fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
+    int waits = 0;
     while (off < len) {
         int sent = (int)send(fd, (const char *)buf + off, (int)(len - off), 0);
         if (sent > 0) {
             off += (size_t)sent;
+            waits = 0;
             continue;
         }
         if (sent < 0 && socket_would_block()) {
-            break;
+            if (++waits > 50) {
+                return -1;
+            }
+            sleep_ms(1);
+            continue;
         }
         return -1;
     }
@@ -2159,11 +2201,21 @@ static int add_tcp_pending(engine_t *e, socket_t fd, uint16_t port,
 static int start_tcp_probe_port(engine_t *e, uint16_t port, uint64_t now) {
     socket_t fd = ST_INVALID_SOCKET;
     int connected = 0;
-    if (find_path(e, PATH_TCP, port) || tcp_pending_exists(e, port)) {
+    path_t *existing = find_path(e, PATH_TCP, port);
+    if ((existing && socket_valid(existing->fd)) || tcp_pending_exists(e, port)) {
+        return 0;
+    }
+    if (existing && existing->next_probe_ms != 0 && now < existing->next_probe_ms) {
         return 0;
     }
     if (make_tcp_connect_socket(e->cfg.server_ip, port, &fd, &connected) != 0) {
+        if (existing) {
+            existing->next_probe_ms = now + 1000;
+        }
         return -1;
+    }
+    if (existing) {
+        existing->next_probe_ms = now + ST_TCP_CONNECT_TIMEOUT_MS;
     }
     return add_tcp_pending(e, fd, port, connected, now);
 }
@@ -2206,12 +2258,19 @@ static int validate_tcp_pending(engine_t *e, tcp_pending_t *tp, uint64_t now) {
             (void)session;
             (void)payload;
             if (type == PKT_HELLO_ACK && seq == tp->hello_seq) {
-                path = add_path(e, PATH_TCP, tp->port);
+                path = find_path(e, PATH_TCP, tp->port);
+                if (!path) {
+                    path = add_path(e, PATH_TCP, tp->port);
+                } else if (socket_valid(path->fd) && path->fd != tp->fd) {
+                    close_socket(path->fd);
+                }
                 if (!path) {
                     return -1;
                 }
                 path->fd = tp->fd;
                 path->healthy = 1;
+                path->next_probe_ms = 0;
+                path->rx_len = 0;
                 fill_remote_addr(e->cfg.server_ip, tp->port, &path->remote);
                 path->last_ack_ms = now;
                 path->rx_bytes += packet_len;
@@ -2326,6 +2385,7 @@ static int vpn_start(engine_t *e) {
     const char *peer_ip;
     const char *local_ip6;
     const char *peer_ip6;
+    const char *resolver_route_ip = "";
     memset(v, 0, sizeof(*v));
 #ifndef _WIN32
     v->fd = ST_INVALID_SOCKET;
@@ -2353,6 +2413,11 @@ static int vpn_start(engine_t *e) {
     peer_ip = e->cfg.mode == MODE_SERVER ? e->cfg.tun_client_ip : e->cfg.tun_server_ip;
     local_ip6 = e->cfg.mode == MODE_SERVER ? e->cfg.tun_server_ip6 : e->cfg.tun_client_ip6;
     peer_ip6 = e->cfg.mode == MODE_SERVER ? e->cfg.tun_client_ip6 : e->cfg.tun_server_ip6;
+    if (e->cfg.mode == MODE_CLIENT && transport_has_dns(e->cfg.transport) &&
+        is_ipv4_literal(e->cfg.dns_tunnel_resolver) &&
+        strcmp(e->cfg.dns_tunnel_resolver, e->cfg.server_ip) != 0) {
+        resolver_route_ip = e->cfg.dns_tunnel_resolver;
+    }
 
 #ifdef _WIN32
     {
@@ -2409,15 +2474,19 @@ static int vpn_start(engine_t *e) {
                              e->cfg.tun_name, e->cfg.dns_server);
         }
         if (e->cfg.mode == MODE_CLIENT && e->cfg.route_all) {
+            if (windows_add_host_route(e, "Configure Windows server route",
+                                       e->cfg.server_ip, 1) != 0) {
+                return -1;
+            }
+            if (resolver_route_ip[0]) {
+                windows_add_host_route(e, "Configure Windows DNS resolver route",
+                                       resolver_route_ip, 0);
+            }
             if (windows_commandf(e, "Configure Windows route-all", 1,
                                  "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
                                  "\"$ErrorActionPreference='Stop'; "
-                                 "$r=Find-NetRoute -RemoteIPAddress '%s' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1; "
-                                 "if(!$r){throw 'No existing route to server IP before enabling tunnel'}; "
-                                 "if($r.NextHop){New-NetRoute -DestinationPrefix '%s/32' -InterfaceIndex $r.InterfaceIndex -NextHop $r.NextHop -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null}else{New-NetRoute -DestinationPrefix '%s/32' -InterfaceIndex $r.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null}; "
                                  "New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null; "
                                  "New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null\"",
-                                 e->cfg.server_ip, e->cfg.server_ip, e->cfg.server_ip,
                                  e->cfg.tun_name, peer_ip, e->cfg.tun_name, peer_ip) != 0) {
                 return -1;
             }
@@ -2438,15 +2507,18 @@ static int vpn_start(engine_t *e) {
         int fd;
         fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
         if (fd < 0) {
-            set_status(e, "Could not open /dev/net/tun; run as root/admin");
+            set_status(e, "Could not open /dev/net/tun: %s; run as root/admin",
+                       strerror(errno));
             return -1;
         }
         memset(&ifr, 0, sizeof(ifr));
         ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
         copy_text(ifr.ifr_name, sizeof(ifr.ifr_name), e->cfg.tun_name);
         if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
+            int saved_errno = errno;
             close(fd);
-            set_status(e, "Could not create TUN device %s", e->cfg.tun_name);
+            set_status(e, "Could not create TUN device %s: %s",
+                       e->cfg.tun_name, strerror(saved_errno));
             return -1;
         }
         v->fd = fd;
@@ -2507,6 +2579,18 @@ static int vpn_start(engine_t *e) {
             } else if (v->route_dev[0]) {
                 systemf("ip route replace %s/32 dev %s", e->cfg.server_ip, v->route_dev);
             }
+            if (resolver_route_ip[0]) {
+                char resolver_dev[64];
+                char resolver_gw[64];
+                capture_route(resolver_route_ip, resolver_dev, sizeof(resolver_dev),
+                              resolver_gw, sizeof(resolver_gw));
+                if (resolver_dev[0] && resolver_gw[0]) {
+                    systemf("ip route replace %s/32 via %s dev %s",
+                            resolver_route_ip, resolver_gw, resolver_dev);
+                } else if (resolver_dev[0]) {
+                    systemf("ip route replace %s/32 dev %s", resolver_route_ip, resolver_dev);
+                }
+            }
             systemf("ip route add 0.0.0.0/1 via %s dev %s >/dev/null 2>&1 || true",
                     peer_ip, e->cfg.tun_name);
             systemf("ip route add 128.0.0.0/1 via %s dev %s >/dev/null 2>&1 || true",
@@ -2534,10 +2618,10 @@ static int vpn_start(engine_t *e) {
 
 static void vpn_stop(engine_t *e) {
     vpn_state_t *v = &e->vpn;
-    if (!e->cfg.vpn_enabled && !v->active) {
+#ifdef _WIN32
+    if (!v->active && !v->session && !v->adapter && !v->wintun) {
         return;
     }
-#ifdef _WIN32
     if (e->cfg.mode == MODE_CLIENT && e->cfg.route_all) {
         char cmd[1024];
         snprintf(cmd, sizeof(cmd),
@@ -2549,7 +2633,7 @@ static void vpn_stop(engine_t *e) {
                  "Remove-NetRoute -DestinationPrefix '%s/32' -Confirm:$false -ErrorAction SilentlyContinue\"",
                  e->cfg.tun_name, e->cfg.tun_name, e->cfg.tun_name,
                  e->cfg.tun_name, e->cfg.server_ip);
-        systemf("%s", cmd);
+        systemf("%s >NUL 2>NUL", cmd);
     }
     if (e->cfg.ipv6_enabled) {
         char cmd[512];
@@ -2558,12 +2642,12 @@ static void vpn_stop(engine_t *e) {
                  "\"Remove-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -Confirm:$false -ErrorAction SilentlyContinue\"",
                  e->cfg.tun_name,
                  e->cfg.mode == MODE_SERVER ? e->cfg.tun_server_ip6 : e->cfg.tun_client_ip6);
-        systemf("%s", cmd);
+        systemf("%s >NUL 2>NUL", cmd);
     }
     if (e->cfg.mode == MODE_CLIENT && e->cfg.dns_enabled) {
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "netsh interface ip set dns name=\"%s\" source=dhcp", e->cfg.tun_name);
-        systemf("%s", cmd);
+        systemf("%s >NUL 2>NUL", cmd);
     }
     if (v->session && pWintunEndSession) {
         pWintunEndSession(v->session);
@@ -2575,6 +2659,9 @@ static void vpn_stop(engine_t *e) {
         FreeLibrary(v->wintun);
     }
 #else
+    if (!v->active && v->fd < 0) {
+        return;
+    }
     if (e->cfg.mode == MODE_CLIENT && e->cfg.route_all) {
         if (e->cfg.dns_enabled) {
             systemf("command -v resolvectl >/dev/null 2>&1 && resolvectl revert %s >/dev/null 2>&1 || true",
@@ -2705,6 +2792,10 @@ static int engine_start(engine_t *e) {
     e->path_count = 0;
     e->path_capacity = 0;
     e->shared_client_fd = ST_INVALID_SOCKET;
+    memset(&e->vpn, 0, sizeof(e->vpn));
+#ifndef _WIN32
+    e->vpn.fd = ST_INVALID_SOCKET;
+#endif
     e->udp_probe_next_port = e->cfg.range_start;
     e->tcp_probe_next_port = e->cfg.range_start;
     e->udp_scan_complete = 0;
@@ -2749,6 +2840,15 @@ static int engine_start(engine_t *e) {
     }
     e->path_capacity = capacity;
     headless_phase(e, "paths_allocated");
+
+    if (e->cfg.mode == MODE_SERVER && e->cfg.vpn_enabled) {
+        headless_phase(e, "vpn_starting");
+        if (vpn_start(e) != 0) {
+            engine_stop_preserve_status(e);
+            return -1;
+        }
+        headless_phase(e, "vpn_ready");
+    }
 
     if (transport_has_dns(e->cfg.transport)) {
         path_t *p = add_path(e, PATH_DNS, ST_DNS_PORT);
@@ -2901,7 +3001,7 @@ static int engine_start(engine_t *e) {
     if (e->cfg.mode == MODE_CLIENT && e->cfg.vpn_enabled) {
         e->vpn_pending = 1;
         headless_phase(e, "vpn_deferred_until_auth");
-    } else {
+    } else if (e->cfg.vpn_enabled && !e->vpn.active) {
         headless_phase(e, "vpn_starting");
         if (vpn_start(e) != 0) {
             engine_stop_preserve_status(e);
@@ -2988,8 +3088,12 @@ static void update_rates(engine_t *e, uint64_t now) {
         p->rx_bps = ((double)prx * 1000.0) / (double)elapsed;
         p->last_tx_bytes = p->tx_bytes;
         p->last_rx_bytes = p->rx_bytes;
-        p->healthy = (e->cfg.mode == MODE_SERVER) || p->last_ack_ms == 0 ||
-                     (now - p->last_ack_ms < 5000);
+        if (e->cfg.mode == MODE_CLIENT && !path_has_socket(p)) {
+            p->healthy = 0;
+        } else {
+            p->healthy = (e->cfg.mode == MODE_SERVER) || p->last_ack_ms == 0 ||
+                         (now - p->last_ack_ms < 5000);
+        }
         tx_delta += ptx;
         rx_delta += prx;
     }
@@ -3009,7 +3113,8 @@ static int authenticated_path_count(const engine_t *e) {
     int i;
     int n = 0;
     for (i = 0; i < e->path_count; i++) {
-        if (e->paths[i].last_ack_ms != 0) {
+        if (e->paths[i].last_ack_ms != 0 &&
+            (e->cfg.mode == MODE_SERVER || path_can_send(&e->paths[i]))) {
             n++;
         }
     }
@@ -3318,6 +3423,10 @@ static void receive_client(engine_t *e, path_t *p, uint64_t now) {
 }
 
 static void receive_client_tcp(engine_t *e, path_t *p, uint64_t now) {
+    if (!socket_valid(p->fd)) {
+        p->healthy = 0;
+        return;
+    }
     if (!p->rx_buf) {
         p->rx_buf = (uint8_t *)malloc(ST_STREAM_BUF);
         if (!p->rx_buf) {
@@ -3335,6 +3444,9 @@ static void receive_client_tcp(engine_t *e, path_t *p, uint64_t now) {
             p->healthy = 0;
             close_socket(p->fd);
             p->fd = ST_INVALID_SOCKET;
+            p->last_ack_ms = 0;
+            p->next_probe_ms = now + 500;
+            p->rx_len = 0;
             set_status(e, "TCP path closed on port %u", (unsigned)p->port);
             return;
         }
@@ -3343,6 +3455,9 @@ static void receive_client_tcp(engine_t *e, path_t *p, uint64_t now) {
                 p->healthy = 0;
                 close_socket(p->fd);
                 p->fd = ST_INVALID_SOCKET;
+                p->last_ack_ms = 0;
+                p->next_probe_ms = now + 500;
+                p->rx_len = 0;
                 set_status(e, "TCP recv error on port %u", (unsigned)p->port);
             }
             return;
@@ -3361,6 +3476,10 @@ static void receive_client_tcp(engine_t *e, path_t *p, uint64_t now) {
                 p->healthy = 0;
                 close_socket(p->fd);
                 p->fd = ST_INVALID_SOCKET;
+                p->last_ack_ms = 0;
+                p->next_probe_ms = now + 500;
+                p->rx_len = 0;
+                set_status(e, "Invalid TCP frame on port %u", (unsigned)p->port);
                 return;
             }
             if (p->rx_len < packet_len) {
@@ -3371,6 +3490,10 @@ static void receive_client_tcp(engine_t *e, path_t *p, uint64_t now) {
                 p->healthy = 0;
                 close_socket(p->fd);
                 p->fd = ST_INVALID_SOCKET;
+                p->last_ack_ms = 0;
+                p->next_probe_ms = now + 500;
+                p->rx_len = 0;
+                set_status(e, "Invalid TCP auth frame on port %u", (unsigned)p->port);
                 return;
             }
             (void)session;
@@ -3400,6 +3523,10 @@ static void receive_client_tcp(engine_t *e, path_t *p, uint64_t now) {
             p->healthy = 0;
             close_socket(p->fd);
             p->fd = ST_INVALID_SOCKET;
+            p->last_ack_ms = 0;
+            p->next_probe_ms = now + 500;
+            p->rx_len = 0;
+            set_status(e, "TCP receive buffer full on port %u", (unsigned)p->port);
             return;
         }
     }
@@ -3730,11 +3857,11 @@ static path_t *choose_path(engine_t *e) {
     for (tries = 0; tries < e->path_count; tries++) {
         int idx = e->next_path++ % e->path_count;
         path_t *p = &e->paths[idx];
-        if (p->healthy || p->last_ack_ms == 0) {
+        if (path_can_send(p)) {
             return p;
         }
     }
-    return &e->paths[e->next_path++ % e->path_count];
+    return NULL;
 }
 
 static int server_send_tunnel_packet(engine_t *e, const uint8_t *payload, uint16_t payload_len) {
@@ -3828,7 +3955,11 @@ static void client_send_hello(engine_t *e, uint64_t now) {
         return;
     }
     for (i = 0; i < e->path_count; i++) {
-        uint64_t seq = e->seq++;
+        uint64_t seq;
+        if (!path_has_socket(&e->paths[i])) {
+            continue;
+        }
+        seq = e->seq++;
         remember_sent(e, seq, now);
         send_packet_path(e, &e->paths[i], PKT_HELLO, (uint8_t)i, seq, NULL, 0, NULL);
     }
@@ -3994,6 +4125,64 @@ static void fmt_rate(double bps, char *out, size_t out_len) {
         unit = "MiB/s";
     }
     snprintf(out, out_len, "%.2f %s", v, unit);
+}
+
+static int contains_ci(const char *text, const char *needle) {
+    size_t needle_len;
+    size_t i;
+    if (!text || !needle || !*needle) {
+        return 0;
+    }
+    needle_len = strlen(needle);
+    for (i = 0; text[i]; i++) {
+        size_t j = 0;
+        while (j < needle_len && text[i + j] &&
+               tolower((unsigned char)text[i + j]) ==
+                   tolower((unsigned char)needle[j])) {
+            j++;
+        }
+        if (j == needle_len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int status_is_error(const char *status) {
+    static const char *needles[] = {
+        "could not",
+        "failed",
+        "failure",
+        "error",
+        "invalid",
+        "unsafe",
+        "not found",
+        "missing",
+        "denied",
+        "no authenticated",
+        "no paths",
+        "no ports",
+        "out of memory",
+        "run as root",
+        "administrator/root",
+        "recv error",
+        "send failed",
+        "closed"
+    };
+    size_t i;
+    for (i = 0; i < sizeof(needles) / sizeof(needles[0]); i++) {
+        if (contains_ci(status, needles[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char *status_color(const char *status) {
+    if (status && status_is_error(status)) {
+        return "\x1b[38;5;196m";
+    }
+    return "\x1b[38;5;245m";
 }
 
 static void term_enable_color(void) {
@@ -4549,7 +4738,8 @@ static void draw_tui(const engine_t *e, tui_page_t page, int selected,
            tx, rx, e->path_count, e->path_capacity);
     printf("   \x1b[38;5;252mVPN I/O\x1b[0m     %-12s / %-12s   \x1b[38;5;252mDrops\x1b[0m %" PRIu64 "\x1b[K\n\x1b[K\n",
            tun_in, tun_out, e->vpn.dropped_packets);
-    printf("   \x1b[38;5;245m%s\x1b[0m\x1b[K\n\x1b[K\n", e->status[0] ? e->status : "Ready");
+    printf("   %s%s\x1b[0m\x1b[K\n\x1b[K\n",
+           status_color(e->status), e->status[0] ? e->status : "Ready");
 
     if (page == TUI_PAGE_RUNTIME) {
         draw_runtime_paths(e);
