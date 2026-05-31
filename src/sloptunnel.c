@@ -60,6 +60,13 @@ static WINTUN_SEND_PACKET_FUNC pWintunSendPacket;
 static WINTUN_RECEIVE_PACKET_FUNC pWintunReceivePacket;
 static WINTUN_RELEASE_RECEIVE_PACKET_FUNC pWintunReleaseReceivePacket;
 static WINTUN_GET_READ_WAIT_EVENT_FUNC pWintunGetReadWaitEvent;
+
+static LONG WINAPI windows_crash_filter(EXCEPTION_POINTERS *info) {
+    DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+    fprintf(stderr, "unhandled_exception=0x%08lx\n", (unsigned long)code);
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 #endif
 
 #define ST_VERSION 1
@@ -787,6 +794,14 @@ static void set_status(engine_t *e, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(e->status, sizeof(e->status), fmt, ap);
     va_end(ap);
+}
+
+static void headless_phase(const engine_t *e, const char *phase) {
+    if (e->cfg.tui) {
+        return;
+    }
+    printf("phase=%s\n", phase);
+    fflush(stdout);
 }
 
 static void copy_text(char *dst, size_t dst_len, const char *src) {
@@ -2468,6 +2483,7 @@ static int engine_start(engine_t *e) {
     int i;
     int capacity;
     uint64_t now;
+    headless_phase(e, "engine_start");
     free(e->paths);
     e->paths = NULL;
     memset(e->peers, 0, sizeof(e->peers));
@@ -2521,6 +2537,7 @@ static int engine_start(engine_t *e) {
         return -1;
     }
     e->path_capacity = capacity;
+    headless_phase(e, "paths_allocated");
 
     if (transport_has_dns(e->cfg.transport)) {
         path_t *p = add_path(e, PATH_DNS, ST_DNS_PORT);
@@ -2547,6 +2564,7 @@ static int engine_start(engine_t *e) {
                 return -1;
             }
         }
+        headless_phase(e, "dns_path_ready");
     }
 
     if (e->cfg.auto_ports && e->cfg.mode == MODE_SERVER) {
@@ -2646,6 +2664,7 @@ static int engine_start(engine_t *e) {
             return -1;
         }
     }
+    headless_phase(e, "transport_paths_ready");
 
     if (e->cfg.auto_ports && e->cfg.mode == MODE_CLIENT) {
         struct sockaddr_in probe;
@@ -2668,10 +2687,12 @@ static int engine_start(engine_t *e) {
         }
     }
 
+    headless_phase(e, "vpn_starting");
     if (vpn_start(e) != 0) {
         engine_stop(e);
         return -1;
     }
+    headless_phase(e, "vpn_ready");
 
     e->running = 1;
     if (e->cfg.auto_ports && e->cfg.mode == MODE_CLIENT) {
@@ -4012,15 +4033,20 @@ static void handle_menu_enter(engine_t *e, int selected) {
 }
 
 static int run_tui(config_t cfg) {
-    engine_t e;
+    engine_t *e;
     int selected = 0;
     uint64_t last_tick;
-    memset(&e, 0, sizeof(e));
-    e.cfg = cfg;
-    set_status(&e, "Ready");
+    e = (engine_t *)calloc(1, sizeof(*e));
+    if (!e) {
+        fprintf(stderr, "out of memory allocating engine\n");
+        return 1;
+    }
+    e->cfg = cfg;
+    set_status(e, "Ready");
 
     if (term_init() != 0) {
         fprintf(stderr, "failed to initialize terminal\n");
+        free(e);
         return 1;
     }
 
@@ -4033,7 +4059,7 @@ static int run_tui(config_t cfg) {
             dt = 1;
         }
         last_tick = now;
-        engine_tick(&e, now, dt);
+        engine_tick(e, now, dt);
 
         ev = read_key();
         if (ev.type == KEY_UP) {
@@ -4041,38 +4067,44 @@ static int run_tui(config_t cfg) {
         } else if (ev.type == KEY_DOWN) {
             selected = (selected + 1) % ST_MAX_MENU;
         } else if (ev.type == KEY_ENTER) {
-            handle_menu_enter(&e, selected);
+            handle_menu_enter(e, selected);
         } else if (ev.type == KEY_CHAR && (ev.ch == 'q' || ev.ch == 'Q')) {
             g_stop = 1;
         }
 
-        if (now - e.last_draw_ms > 100) {
-            draw_tui(&e, selected, NULL, NULL);
-            e.last_draw_ms = now;
+        if (now - e->last_draw_ms > 100) {
+            draw_tui(e, selected, NULL, NULL);
+            e->last_draw_ms = now;
         }
         sleep_ms(10);
     }
 
-    if (e.running) {
-        engine_stop(&e);
+    if (e->running) {
+        engine_stop(e);
     }
     term_restore();
+    free(e);
     return 0;
 }
 
 static int run_headless(config_t cfg) {
-    engine_t e;
+    engine_t *e;
     uint64_t last_tick;
     uint64_t last_print = 0;
-    memset(&e, 0, sizeof(e));
-    e.cfg = cfg;
+    e = (engine_t *)calloc(1, sizeof(*e));
+    if (!e) {
+        fprintf(stderr, "out of memory allocating engine\n");
+        return 1;
+    }
+    e->cfg = cfg;
 
-    if (engine_start(&e) != 0) {
-        fprintf(stderr, "%s\n", e.status);
+    if (engine_start(e) != 0) {
+        fprintf(stderr, "%s\n", e->status);
+        free(e);
         return 1;
     }
 
-    printf("%s\n", e.status);
+    printf("%s\n", e->status);
     last_tick = now_ms();
     while (!g_stop) {
         uint64_t now = now_ms();
@@ -4085,22 +4117,23 @@ static int run_headless(config_t cfg) {
             dt = 1;
         }
         last_tick = now;
-        engine_tick(&e, now, dt);
+        engine_tick(e, now, dt);
         if (now - last_print >= 1000) {
-            fmt_rate(e.tx_bps, tx, sizeof(tx));
-            fmt_rate(e.rx_bps, rx, sizeof(rx));
-            fmt_rate(e.vpn.tun_in_bps, tun_in, sizeof(tun_in));
-            fmt_rate(e.vpn.tun_out_bps, tun_out, sizeof(tun_out));
+            fmt_rate(e->tx_bps, tx, sizeof(tx));
+            fmt_rate(e->rx_bps, rx, sizeof(rx));
+            fmt_rate(e->vpn.tun_in_bps, tun_in, sizeof(tun_in));
+            fmt_rate(e->vpn.tun_out_bps, tun_out, sizeof(tun_out));
             printf("mode=%s paths=%d/%d tx=%s rx=%s tun_in=%s tun_out=%s drops=%" PRIu64 " total=%" PRIu64 "/%" PRIu64 " peers=%d status=%s\n",
-                   mode_name(e.cfg.mode), e.path_count, e.path_capacity,
-                   tx, rx, tun_in, tun_out, e.vpn.dropped_packets,
-                   e.total_tx, e.total_rx, e.active_peers, e.status);
+                   mode_name(e->cfg.mode), e->path_count, e->path_capacity,
+                   tx, rx, tun_in, tun_out, e->vpn.dropped_packets,
+                   e->total_tx, e->total_rx, e->active_peers, e->status);
             fflush(stdout);
             last_print = now;
         }
         sleep_ms(10);
     }
-    engine_stop(&e);
+    engine_stop(e);
+    free(e);
     return 0;
 }
 
@@ -4236,10 +4269,23 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    if (!cfg.tui) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+#ifdef _WIN32
+        SetUnhandledExceptionFilter(windows_crash_filter);
+#endif
+        printf("phase=main\n");
+        fflush(stdout);
+    }
 
     if (network_init() != 0) {
         fprintf(stderr, "network initialization failed\n");
         return 1;
+    }
+    if (!cfg.tui) {
+        printf("phase=network_ready\n");
+        fflush(stdout);
     }
 
     rc = cfg.tui ? run_tui(cfg) : run_headless(cfg);
