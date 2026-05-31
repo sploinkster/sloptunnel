@@ -15,6 +15,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <io.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
@@ -304,6 +305,7 @@ typedef struct {
     uint64_t last_rate_ms;
     uint64_t last_hello_ms;
     uint64_t last_draw_ms;
+    uint64_t last_diagnostic_ms;
     uint64_t total_tx;
     uint64_t total_rx;
     double tx_bps;
@@ -865,6 +867,86 @@ static int systemf(const char *fmt, ...) {
     va_end(ap);
     return system(cmd);
 }
+
+#ifdef _WIN32
+static void trim_command_output(char *s) {
+    size_t n;
+    if (!s) {
+        return;
+    }
+    n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' ||
+                     s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = '\0';
+    }
+}
+
+static int command_status_code(int rc) {
+    return rc == -1 ? -1 : rc;
+}
+#endif
+
+#ifdef _WIN32
+static int windows_command_capture(const char *cmd, char *out, size_t out_len) {
+    char wrapped[2300];
+    FILE *p;
+    size_t used = 0;
+    int rc;
+    if (out_len > 0) {
+        out[0] = '\0';
+    }
+    if (snprintf(wrapped, sizeof(wrapped), "%s 2>&1", cmd) >= (int)sizeof(wrapped)) {
+        if (out_len > 0) {
+            copy_text(out, out_len, "command line too long");
+        }
+        return -1;
+    }
+    p = _popen(wrapped, "r");
+    if (!p) {
+        if (out_len > 0) {
+            copy_text(out, out_len, "could not launch helper command");
+        }
+        return -1;
+    }
+    while (out_len > 1 && used + 1 < out_len) {
+        size_t n = fread(out + used, 1, out_len - used - 1, p);
+        used += n;
+        out[used] = '\0';
+        if (n == 0) {
+            break;
+        }
+    }
+    rc = _pclose(p);
+    trim_command_output(out);
+    return command_status_code(rc);
+}
+
+static int windows_commandf(engine_t *e, const char *label, int fatal,
+                            const char *fmt, ...) {
+    char cmd[2200];
+    char output[512];
+    va_list ap;
+    int n;
+    int rc;
+    va_start(ap, fmt);
+    n = vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        set_status(e, "%s failed: helper command line too long", label);
+        return fatal ? -1 : 0;
+    }
+    rc = windows_command_capture(cmd, output, sizeof(output));
+    if (rc == 0) {
+        return 0;
+    }
+    if (output[0]) {
+        set_status(e, "%s failed: %s", label, output);
+    } else {
+        set_status(e, "%s failed with exit code %d", label, rc);
+    }
+    return fatal ? -1 : 0;
+}
+#endif
 
 #ifndef _WIN32
 static int capture_command(const char *cmd, char *out, size_t out_len) {
@@ -2173,7 +2255,6 @@ static int vpn_start(engine_t *e) {
     {
         wchar_t name_w[96];
         wchar_t type_w[32];
-        char cmd[1024];
         if (load_wintun(v) != 0) {
             set_status(e, "wintun.dll not found or missing API");
             return -1;
@@ -2197,45 +2278,54 @@ static int vpn_start(engine_t *e) {
             return -1;
         }
         v->read_wait = pWintunGetReadWaitEvent(v->session);
-        snprintf(cmd, sizeof(cmd),
-                 "netsh interface ip set address name=\"%s\" static %s 255.255.255.0",
-                 e->cfg.tun_name, local_ip);
-        systemf("%s", cmd);
-        snprintf(cmd, sizeof(cmd),
-                 "netsh interface ipv4 set interface \"%s\" metric=1",
-                 e->cfg.tun_name);
-        systemf("%s", cmd);
+        if (windows_commandf(e, "Configure Windows tunnel IPv4", 1,
+                             "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                             "\"$ErrorActionPreference='Stop'; "
+                             "Remove-NetIPAddress -InterfaceAlias '%s' -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue; "
+                             "New-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -PrefixLength 24 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; "
+                             "Set-NetIPInterface -InterfaceAlias '%s' -AddressFamily IPv4 -InterfaceMetric 1 -ErrorAction Stop\"",
+                             e->cfg.tun_name, e->cfg.tun_name, local_ip, e->cfg.tun_name) != 0) {
+            return -1;
+        }
         if (e->cfg.ipv6_enabled) {
-            snprintf(cmd, sizeof(cmd),
-                     "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                     "\"New-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -PrefixLength 64 -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction SilentlyContinue; "
-                     "Set-NetIPInterface -InterfaceAlias '%s' -AddressFamily IPv6 -InterfaceMetric 1 -ErrorAction SilentlyContinue\"",
-                     e->cfg.tun_name, local_ip6, e->cfg.tun_name);
-            systemf("%s", cmd);
+            if (windows_commandf(e, "Configure Windows tunnel IPv6", 1,
+                                 "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                                 "\"$ErrorActionPreference='Stop'; "
+                                 "Remove-NetIPAddress -InterfaceAlias '%s' -AddressFamily IPv6 -Confirm:$false -ErrorAction SilentlyContinue; "
+                                 "New-NetIPAddress -InterfaceAlias '%s' -IPAddress '%s' -PrefixLength 64 -AddressFamily IPv6 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; "
+                                 "Set-NetIPInterface -InterfaceAlias '%s' -AddressFamily IPv6 -InterfaceMetric 1 -ErrorAction Stop\"",
+                                 e->cfg.tun_name, e->cfg.tun_name, local_ip6,
+                                 e->cfg.tun_name) != 0) {
+                return -1;
+            }
         }
         if (e->cfg.mode == MODE_CLIENT && e->cfg.dns_enabled) {
-            snprintf(cmd, sizeof(cmd),
-                     "netsh interface ip set dns name=\"%s\" static %s",
-                     e->cfg.tun_name, e->cfg.dns_server);
-            systemf("%s", cmd);
+            windows_commandf(e, "Configure Windows tunnel DNS", 0,
+                             "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                             "\"Set-DnsClientServerAddress -InterfaceAlias '%s' -ServerAddresses '%s' -ErrorAction Stop\"",
+                             e->cfg.tun_name, e->cfg.dns_server);
         }
         if (e->cfg.mode == MODE_CLIENT && e->cfg.route_all) {
-            snprintf(cmd, sizeof(cmd),
-                     "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                     "\"$r=Find-NetRoute -RemoteIPAddress '%s' | Sort-Object RouteMetric | Select-Object -First 1; "
-                     "if($r){New-NetRoute -DestinationPrefix '%s/32' -InterfaceIndex $r.InterfaceIndex -NextHop $r.NextHop -PolicyStore ActiveStore -ErrorAction SilentlyContinue}; "
-                     "New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue; "
-                     "New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue\"",
-                     e->cfg.server_ip, e->cfg.server_ip, e->cfg.tun_name, peer_ip,
-                     e->cfg.tun_name, peer_ip);
-            systemf("%s", cmd);
+            if (windows_commandf(e, "Configure Windows route-all", 1,
+                                 "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                                 "\"$ErrorActionPreference='Stop'; "
+                                 "$r=Find-NetRoute -RemoteIPAddress '%s' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1; "
+                                 "if(!$r){throw 'No existing route to server IP before enabling tunnel'}; "
+                                 "if($r.NextHop){New-NetRoute -DestinationPrefix '%s/32' -InterfaceIndex $r.InterfaceIndex -NextHop $r.NextHop -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null}else{New-NetRoute -DestinationPrefix '%s/32' -InterfaceIndex $r.InterfaceIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null}; "
+                                 "New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null; "
+                                 "New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null\"",
+                                 e->cfg.server_ip, e->cfg.server_ip, e->cfg.server_ip,
+                                 e->cfg.tun_name, peer_ip, e->cfg.tun_name, peer_ip) != 0) {
+                return -1;
+            }
             if (e->cfg.ipv6_enabled) {
-                snprintf(cmd, sizeof(cmd),
-                         "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-                         "\"New-NetRoute -DestinationPrefix '::/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue; "
-                         "New-NetRoute -DestinationPrefix '8000::/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue\"",
-                         e->cfg.tun_name, peer_ip6, e->cfg.tun_name, peer_ip6);
-                systemf("%s", cmd);
+                if (windows_commandf(e, "Configure Windows IPv6 route-all", 1,
+                                     "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+                                     "\"New-NetRoute -DestinationPrefix '::/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null; "
+                                     "New-NetRoute -DestinationPrefix '8000::/1' -InterfaceAlias '%s' -NextHop '%s' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null\"",
+                                     e->cfg.tun_name, peer_ip6, e->cfg.tun_name, peer_ip6) != 0) {
+                    return -1;
+                }
             }
         }
     }
@@ -2528,6 +2618,7 @@ static int engine_start(engine_t *e) {
     e->started_ms = now;
     e->last_rate_ms = e->started_ms;
     e->last_hello_ms = 0;
+    e->last_diagnostic_ms = 0;
     e->send_credit = 0.0;
     e->next_path = 0;
     e->total_tx = 0;
@@ -2780,6 +2871,49 @@ static void update_rates(engine_t *e, uint64_t now) {
     e->vpn.last_tun_out_bytes = e->vpn.tun_out_bytes;
     e->active_peers = count_active_peers(e, now);
     e->last_rate_ms = now;
+}
+
+static int authenticated_path_count(const engine_t *e) {
+    int i;
+    int n = 0;
+    for (i = 0; i < e->path_count; i++) {
+        if (e->paths[i].last_ack_ms != 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static int client_scan_complete(const engine_t *e) {
+    if (!e->cfg.auto_ports) {
+        return 1;
+    }
+    if (transport_has_udp(e->cfg.transport) && !e->udp_scan_complete) {
+        return 0;
+    }
+    if (transport_has_tcp(e->cfg.transport) && !e->tcp_scan_complete) {
+        return 0;
+    }
+    return 1;
+}
+
+static void diagnose_client_connectivity(engine_t *e, uint64_t now) {
+    const char *scope;
+    if (e->cfg.mode != MODE_CLIENT || !e->running || authenticated_path_count(e) > 0) {
+        return;
+    }
+    if (now - e->started_ms < 6000 || now - e->last_diagnostic_ms < 5000) {
+        return;
+    }
+    e->last_diagnostic_ms = now;
+    scope = transport_has_dns(e->cfg.transport) &&
+            !(transport_has_udp(e->cfg.transport) || transport_has_tcp(e->cfg.transport)) ?
+            "DNS tunnel" : "tunnel";
+    if (client_scan_complete(e)) {
+        set_status(e, "No authenticated %s paths found; check server IP, token, firewall, and transport settings", scope);
+    } else {
+        set_status(e, "Waiting for authenticated %s replies; check token/server IP if this persists", scope);
+    }
 }
 
 static void receive_server(engine_t *e, path_t *p, int index, uint64_t now) {
@@ -3688,6 +3822,7 @@ static void engine_tick(engine_t *e, uint64_t now, uint64_t dt_ms) {
         }
     }
 
+    diagnose_client_connectivity(e, now);
     update_rates(e, now);
 }
 
@@ -4339,6 +4474,21 @@ static int prompt_text(engine_t *e, tui_page_t page, int selected, const char *l
     }
 }
 
+static void maybe_pause_on_windows_error(const config_t *cfg) {
+#ifdef _WIN32
+    if (cfg && cfg->tui && _isatty(_fileno(stdin))) {
+        int ch;
+        fprintf(stderr, "\nPress Enter to exit...");
+        fflush(stderr);
+        do {
+            ch = getchar();
+        } while (ch != '\n' && ch != '\r' && ch != EOF);
+    }
+#else
+    (void)cfg;
+#endif
+}
+
 static void handle_menu_enter(engine_t *e, tui_page_t *page, int *selected) {
     char input[256];
     char current[256];
@@ -4552,7 +4702,8 @@ static int run_tui(config_t cfg) {
     set_status(e, "Ready");
 
     if (term_init() != 0) {
-        fprintf(stderr, "failed to initialize terminal\n");
+        fprintf(stderr, "error: failed to initialize terminal\n");
+        maybe_pause_on_windows_error(&cfg);
         free(e);
         return 1;
     }
@@ -4614,7 +4765,8 @@ static int run_headless(config_t cfg) {
     e->cfg = cfg;
 
     if (engine_start(e) != 0) {
-        fprintf(stderr, "%s\n", e->status);
+        fprintf(stderr, "error: %s\n", e->status);
+        maybe_pause_on_windows_error(&cfg);
         free(e);
         return 1;
     }
@@ -4782,6 +4934,7 @@ int main(int argc, char **argv) {
     config_defaults(&cfg);
     if (parse_args(argc, argv, &cfg) != 0) {
         usage(argv[0]);
+        maybe_pause_on_windows_error(&cfg);
         return 2;
     }
     if (!cfg.tui) {
@@ -4795,7 +4948,8 @@ int main(int argc, char **argv) {
     }
 
     if (network_init() != 0) {
-        fprintf(stderr, "network initialization failed\n");
+        fprintf(stderr, "error: network initialization failed\n");
+        maybe_pause_on_windows_error(&cfg);
         return 1;
     }
     if (!cfg.tui) {

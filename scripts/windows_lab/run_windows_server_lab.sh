@@ -14,7 +14,12 @@ FW_NS="${SLOPTUNNEL_WINDOWS_FW_NS:-slop-win-fw}"
 SERVER_IP="${SLOPTUNNEL_SERVER_IP:-18.219.84.252}"
 DNS_DOMAIN="${SLOPTUNNEL_DNS_DOMAIN:-sploinkstersploinkster.online}"
 TCP_PORT="${SLOPTUNNEL_TCP_PORT:-5223}"
+TOKEN_FILE="${SLOPTUNNEL_TOKEN_FILE:-$ROOT_DIR/keys/sloptunnel-token.txt}"
 QEMU_TIMEOUT="${SLOPTUNNEL_WINDOWS_QEMU_TIMEOUT:-7200}"
+QEMU_ACCEL="${SLOPTUNNEL_QEMU_ACCEL:-auto}"
+QEMU_CPU="${SLOPTUNNEL_QEMU_CPU:-qemu64}"
+QEMU_SMP="${SLOPTUNNEL_QEMU_SMP:-2}"
+QEMU_MEM="${SLOPTUNNEL_QEMU_MEM:-4096}"
 
 need_root() {
   if [[ "$(id -u)" != "0" ]]; then
@@ -63,8 +68,10 @@ if [[ ! -r "$ISO" ]]; then
   echo "missing Windows Server ISO: $ISO" >&2
   exit 1
 fi
-if [[ ! -r "$ANSWER_ISO" ]]; then
-  "$ROOT_DIR/scripts/windows_lab/make_answer_iso.sh"
+if [[ ! -r "$ANSWER_ISO" || "$ROOT_DIR/build/sloptunnel.exe" -nt "$ANSWER_ISO" ||
+      "$TOKEN_FILE" -nt "$ANSWER_ISO" ||
+      "$ROOT_DIR/scripts/windows_lab/make_answer_iso.sh" -nt "$ANSWER_ISO" ]]; then
+  SLOPTUNNEL_TOKEN_FILE="$TOKEN_FILE" "$ROOT_DIR/scripts/windows_lab/make_answer_iso.sh"
 fi
 
 mkdir -p "$RESULTS"
@@ -168,15 +175,41 @@ ip netns exec "$CLIENT_NS" dnsmasq --no-daemon --no-hosts --no-resolv --port=0 \
 CLIENT_DHCP_PID="$!"
 sleep 1
 
+if [[ "$QEMU_ACCEL" == "auto" ]]; then
+  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    QEMU_ACCEL="kvm"
+    QEMU_CPU="${SLOPTUNNEL_QEMU_CPU:-host}"
+  else
+    QEMU_ACCEL="tcg"
+  fi
+fi
+
+case "$QEMU_ACCEL" in
+  kvm)
+    if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+      echo "KVM requested but /dev/kvm is not available; expose nested virtualization or use SLOPTUNNEL_QEMU_ACCEL=tcg" >&2
+      exit 1
+    fi
+    QEMU_ACCEL_ARGS=(-accel kvm)
+    ;;
+  tcg)
+    QEMU_ACCEL_ARGS=(-accel tcg,thread=multi)
+    ;;
+  *)
+    echo "invalid SLOPTUNNEL_QEMU_ACCEL: $QEMU_ACCEL" >&2
+    exit 1
+    ;;
+esac
+
 echo "preflight: direct host namespace route exists; Windows VM traffic is constrained inside $CLIENT_NS"
-echo "starting Windows Server VM under QEMU TCG; timeout ${QEMU_TIMEOUT}s"
+echo "starting Windows Server VM using $QEMU_ACCEL; timeout ${QEMU_TIMEOUT}s"
 
 QEMU_NET_OPTS="tap,id=n0,ifname=stw-tap0,script=no,downscript=no"
 QEMU_ARGS=(
-  -machine accel=tcg
-  -cpu qemu64
-  -smp 2
-  -m 4096
+  "${QEMU_ACCEL_ARGS[@]}"
+  -cpu "$QEMU_CPU"
+  -smp "$QEMU_SMP"
+  -m "$QEMU_MEM"
   -display none
   -vnc "unix:$VNC_SOCKET"
   -monitor "unix:$MONITOR,server=on,wait=off"
