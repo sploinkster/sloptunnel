@@ -7,7 +7,7 @@ KEY="${SLOPTUNNEL_EC2_KEY:-keys/sloptunnel-ec2.pem}"
 PORTS="${SLOPTUNNEL_PORTS:-auto}"
 TRANSPORT="${SLOPTUNNEL_TRANSPORT:-all}"
 MAX_AUTO_PORTS="${SLOPTUNNEL_MAX_AUTO_PORTS:-65535}"
-TOKEN="${SLOPTUNNEL_TOKEN:-change-me}"
+TOKEN_FILE_DEFAULT="${SLOPTUNNEL_TOKEN_FILE:-keys/sloptunnel-token.txt}"
 REMOTE_DIR="${SLOPTUNNEL_REMOTE_DIR:-/home/ubuntu/sloptunnel}"
 USE_SUDO="${SLOPTUNNEL_USE_SUDO:-1}"
 DNS_DOMAIN="${SLOPTUNNEL_DNS_DOMAIN:-sploinkstersploinkster.online}"
@@ -17,6 +17,14 @@ trap 'rm -f "$LOCAL_TOKEN_FILE"' EXIT
 
 if [[ "${SLOPTUNNEL_IPV6:-0}" == "1" ]]; then
   IPV6_ARG="--ipv6"
+fi
+
+if [[ -n "${SLOPTUNNEL_TOKEN:-}" ]]; then
+  TOKEN="$SLOPTUNNEL_TOKEN"
+elif [[ -r "$TOKEN_FILE_DEFAULT" ]]; then
+  TOKEN="$(< "$TOKEN_FILE_DEFAULT")"
+else
+  TOKEN="change-me"
 fi
 
 printf '%s\n' "$TOKEN" > "$LOCAL_TOKEN_FILE"
